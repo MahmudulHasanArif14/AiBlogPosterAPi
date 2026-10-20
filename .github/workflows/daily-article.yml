@@ -16,17 +16,26 @@ on:
     - cron: "10 3 * * *"
   workflow_dispatch:
     inputs:
+      mode:
+        description: "What to run"
+        required: true
+        default: daily
+        type: choice
+        options:
+          - daily
+          - seed
+          - location
       location:
-        description: "Generate for one location instead of taking the daily slot (slug, e.g. brighton)"
+        description: "Location slug, for mode=location (e.g. brighton)"
         required: false
         type: string
       topic:
-        description: "Optional topic brief for that location"
+        description: "Optional topic brief, for mode=location"
         required: false
         type: string
 
-# Never let two runs generate at once. The database would reject the duplicate,
-# but failing here is clearer than relying on that.
+# Never let two runs generate at once. The database would reject a duplicate
+# daily slot anyway, but failing here is clearer than relying on that.
 concurrency:
   group: daily-article
   cancel-in-progress: false
@@ -34,7 +43,8 @@ concurrency:
 jobs:
   generate:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    # The seed batch generates up to five articles at 60-115 seconds each.
+    timeout-minutes: 30
 
     env:
       NEXT_PUBLIC_SUPABASE_URL: ${{ secrets.NEXT_PUBLIC_SUPABASE_URL }}
@@ -54,15 +64,41 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: "20"
+          # 22, not 20. @supabase/supabase-js constructs a RealtimeClient when
+          # the client is created and throws on a runtime with no global
+          # WebSocket, which Node 20 does not have.
+          node-version: "22"
           cache: npm
 
       - run: npm ci
 
-      - name: Generate today's article
+      - name: Generate
+        # Dispatch inputs are passed as environment variables, not interpolated
+        # into the script. Inline `${{ inputs.topic }}` breaks on the first
+        # space and would let dispatch input execute as shell.
+        env:
+          MODE: ${{ inputs.mode || 'daily' }}
+          INPUT_LOCATION: ${{ inputs.location }}
+          INPUT_TOPIC: ${{ inputs.topic }}
         run: |
-          if [ -n "${{ inputs.location }}" ]; then
-            npm run generate:one -- --location "${{ inputs.location }}" ${{ inputs.topic && format('--topic "{0}"', inputs.topic) || '' }}
-          else
-            npm run generate:daily
-          fi
+          set -euo pipefail
+
+          case "$MODE" in
+            seed)
+              npx tsx scripts/generate.ts --seed
+              ;;
+            location)
+              if [ -z "${INPUT_LOCATION:-}" ]; then
+                echo "mode=location requires the location input." >&2
+                exit 1
+              fi
+              if [ -n "${INPUT_TOPIC:-}" ]; then
+                npx tsx scripts/generate.ts --location "$INPUT_LOCATION" --topic "$INPUT_TOPIC"
+              else
+                npx tsx scripts/generate.ts --location "$INPUT_LOCATION"
+              fi
+              ;;
+            *)
+              npx tsx scripts/generate.ts --daily
+              ;;
+          esac
