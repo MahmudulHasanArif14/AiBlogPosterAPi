@@ -3,25 +3,41 @@ import { unstable_cache } from "next/cache";
 import { POSTS_CACHE_TAG, siteUrl } from "@/lib/config";
 import { supabaseAdmin } from "@/lib/supabase";
 
-export const revalidate = 300;
+// Rendered on demand, never at build time. Prerendering this meant the build
+// opened a database connection, so a deployment whose environment lacked the
+// Supabase variables — a preview build, for instance — failed outright with
+// "Missing server Supabase environment variables". A sitemap must not be able
+// to take a deployment down.
+export const dynamic = "force-dynamic";
 
 // Tagged as well as time-limited, so publishing an article refreshes the
 // sitemap immediately instead of leaving it up to five minutes stale.
 const loadPublishedPosts = unstable_cache(
   async () => {
-    const { data, error } = await supabaseAdmin()
-      .from("posts")
-      .select("slug,published_at,updated_at,image_url,canonical_url")
-      .eq("status", "published")
-      .order("published_at", { ascending: false })
-      .limit(5000);
+    try {
+      const { data, error } = await supabaseAdmin()
+        .from("posts")
+        .select("slug,published_at,updated_at,image_url,canonical_url")
+        .eq("status", "published")
+        .order("published_at", { ascending: false })
+        .limit(5000);
 
-    if (error) {
-      console.error("sitemap_query_failed:", error.message);
+      if (error) {
+        console.error("sitemap_query_failed:", error.message);
+        return [];
+      }
+
+      return data ?? [];
+    } catch (error) {
+      // Missing configuration or an unreachable database degrades the sitemap
+      // to its static pages. Serving a short sitemap beats serving a 500.
+      console.error(
+        "sitemap_unavailable:",
+        error instanceof Error ? error.message : "unknown error",
+      );
+
       return [];
     }
-
-    return data ?? [];
   },
   ["western-cars-sitemap"],
   { revalidate: 300, tags: [POSTS_CACHE_TAG] },
