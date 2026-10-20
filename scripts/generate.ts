@@ -19,16 +19,52 @@ import { PLATFORM_TIMEZONE, siteUrl } from "../src/lib/config";
 import { runGenerationJob } from "../src/lib/generation";
 import { supabaseAdmin } from "../src/lib/supabase";
 
-type Args = { daily: boolean; location?: string; topic?: string };
+type Args = { daily: boolean; seed: boolean; location?: string; topic?: string };
+
+/**
+ * The initial batch. Five different locations and five genuinely different
+ * reader problems, so this is not one article with the place name swapped.
+ * A location that already has a published article is skipped, which makes the
+ * whole batch safe to re-run.
+ */
+const SEED_BATCH = [
+  {
+    locationSlug: "brighton",
+    topic:
+      "Arriving into Brighton Station for the first time: how to work out which onward option suits your group, your luggage and the time of day, and what to settle before you step off the train.",
+  },
+  {
+    locationSlug: "gatwick",
+    topic:
+      "Meeting someone arriving at Gatwick Airport: how the two terminals differ for pick-ups, how to decide where to wait, and how to plan around a flight whose arrival time you cannot control.",
+  },
+  {
+    locationSlug: "worthing",
+    topic:
+      "Travelling along the Sussex coast with heavy luggage, young children or reduced mobility: what to check about a station or route before you commit to it, and when a door-to-door option earns its cost.",
+  },
+  {
+    locationSlug: "haywards-heath",
+    topic:
+      "Planning a very early or very late journey from Haywards Heath: how to work out whether public transport will actually be running, and what to arrange the night before so the plan does not depend on luck.",
+  },
+  {
+    locationSlug: "crawley",
+    topic:
+      "Getting around Crawley and Three Bridges when the trains are disrupted: how to read what has actually happened, what the realistic alternatives are, and how to decide quickly rather than waiting on the platform.",
+  },
+];
 
 function parseArgs(argv: string[]): Args {
-  const args: Args = { daily: false };
+  const args: Args = { daily: false, seed: false };
 
   for (let i = 0; i < argv.length; i += 1) {
     const flag = argv[i];
 
     if (flag === "--daily") {
       args.daily = true;
+    } else if (flag === "--seed") {
+      args.seed = true;
     } else if (flag === "--location") {
       args.location = argv[++i];
     } else if (flag === "--topic") {
@@ -201,15 +237,138 @@ async function createManualJob(locationSlug: string, topic?: string) {
   };
 }
 
+/** Print one generation outcome. Returns true if an article was published. */
+function report(outcome: { httpStatus: number; body: Record<string, unknown> }, seconds: string) {
+  const body = outcome.body as Record<string, unknown> & {
+    post?: { title: string; slug: string; status: string };
+    published?: boolean;
+    retryable?: boolean;
+    quality?: {
+      score: number;
+      pass: boolean;
+      reasons: string[];
+      warnings: string[];
+      words: number;
+      maxContentSimilarity: number;
+    };
+    verification?: { status: string };
+    image?: { provider: string | null } | null;
+  };
+
+  console.log(`HTTP ${outcome.httpStatus} in ${seconds}s`);
+
+  if (body.post) {
+    console.log(`  title       : ${body.post.title}`);
+    console.log(`  slug        : ${body.post.slug}`);
+    console.log(`  status      : ${body.post.status}`);
+    console.log(`  published   : ${body.published}`);
+    console.log(`  quality     : score=${body.quality?.score} pass=${body.quality?.pass}`);
+
+    if (body.quality?.reasons?.length) {
+      console.log(`  BLOCKED BY  : ${body.quality.reasons.join(", ")}`);
+    }
+
+    if (body.quality?.warnings?.length) {
+      console.log(`  warnings    : ${body.quality.warnings.join(", ")}`);
+    }
+
+    console.log(
+      `  words       : ${body.quality?.words}  similarity=${body.quality?.maxContentSimilarity}`,
+    );
+    console.log(`  verification: ${body.verification?.status}`);
+    console.log(`  image       : ${body.image ? body.image.provider : "none"}`);
+  } else {
+    console.log(`  ${JSON.stringify(body).slice(0, 800)}`);
+  }
+
+  return Boolean(body.published);
+}
+
+/** Locations that already have a published article, so seeding can skip them. */
+async function locationsWithPublishedContent() {
+  const db = supabaseAdmin();
+
+  const { data, error } = await db
+    .from("posts")
+    .select("locations(slug)")
+    .eq("status", "published");
+
+  if (error) {
+    throw new Error(`published_lookup_failed: ${error.message}`);
+  }
+
+  const slugs = new Set<string>();
+
+  for (const row of data ?? []) {
+    const location = (row as { locations?: { slug?: string } }).locations;
+
+    if (location?.slug) {
+      slugs.add(location.slug);
+    }
+  }
+
+  return slugs;
+}
+
+async function runSeedBatch() {
+  const alreadyCovered = await locationsWithPublishedContent();
+  let published = 0;
+
+  for (const item of SEED_BATCH) {
+    console.log(`
+=== ${item.locationSlug} ===`);
+
+    if (alreadyCovered.has(item.locationSlug)) {
+      console.log("  already has a published article; skipping");
+      continue;
+    }
+
+    const started = Date.now();
+
+    try {
+      const target = await createManualJob(item.locationSlug, item.topic);
+      const outcome = await runGenerationJob(target);
+
+      if (report(outcome, ((Date.now() - started) / 1000).toFixed(1))) {
+        published += 1;
+      }
+    } catch (error) {
+      // One location failing must not abandon the rest of the batch.
+      console.error(
+        `  failed: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+  }
+
+  console.log(`
+Seed batch complete: ${published} article(s) published.`);
+
+  if (published > 0) {
+    await revalidateHub();
+  }
+
+  if (published === 0) {
+    console.error("No articles were published. See the per-location output above.");
+    process.exit(1);
+  }
+}
+
 async function main() {
   const args = parseArgs(process.argv.slice(2));
 
-  if (!args.daily && !args.location) {
-    console.error("Usage: tsx scripts/generate.ts --daily | --location <slug> [--topic <text>]");
+  if (!args.daily && !args.seed && !args.location) {
+    console.error(
+      "Usage: tsx scripts/generate.ts --daily | --seed | --location <slug> [--topic <text>]",
+    );
     process.exit(1);
   }
 
   requireEnv();
+
+  if (args.seed) {
+    await runSeedBatch();
+    return;
+  }
 
   const started = Date.now();
   let target: { jobId: string; locationSlug: string; topic: string };
@@ -244,60 +403,25 @@ async function main() {
 
   const outcome = await runGenerationJob(target);
   const seconds = ((Date.now() - started) / 1000).toFixed(1);
-  const body = outcome.body as Record<string, unknown> & {
-    post?: { title: string; slug: string; status: string };
-    published?: boolean;
-    retryable?: boolean;
-    quality?: {
-      score: number;
-      pass: boolean;
-      reasons: string[];
-      warnings: string[];
-      words: number;
-      maxContentSimilarity: number;
-    };
-    verification?: { status: string };
-    image?: { provider: string | null } | null;
-  };
 
-  console.log(`\nHTTP ${outcome.httpStatus} in ${seconds}s`);
+  console.log("");
+  const published = report(outcome, seconds);
 
-  if (body.post) {
-    console.log(`  title       : ${body.post.title}`);
-    console.log(`  slug        : ${body.post.slug}`);
-    console.log(`  status      : ${body.post.status}`);
-    console.log(`  published   : ${body.published}`);
-    console.log(`  quality     : score=${body.quality?.score} pass=${body.quality?.pass}`);
-
-    if (body.quality?.reasons?.length) {
-      console.log(`  BLOCKED BY  : ${body.quality.reasons.join(", ")}`);
-    }
-
-    if (body.quality?.warnings?.length) {
-      console.log(`  warnings    : ${body.quality.warnings.join(", ")}`);
-    }
-
-    console.log(
-      `  words       : ${body.quality?.words}  similarity=${body.quality?.maxContentSimilarity}`,
-    );
-    console.log(`  verification: ${body.verification?.status}`);
-    console.log(`  image       : ${body.image ? body.image.provider : "none"}`);
-  } else {
-    console.log(`  ${JSON.stringify(body).slice(0, 800)}`);
-  }
-
-  if (body.published) {
+  if (published) {
     await revalidateHub();
   }
 
   // A retryable failure is not a red build: the job keeps its attempts and the
   // next run picks it up. Only an unexpected failure should page anyone.
+  const body = outcome.body as { retryable?: boolean };
+
   if (outcome.httpStatus >= 500 && !body.retryable) {
     process.exit(1);
   }
 }
 
 main().catch((error) => {
-  console.error(error instanceof Error ? error.message : error);
+  console.error("Generation worker failed:");
+  console.error(error instanceof Error ? (error.stack ?? error.message) : error);
   process.exit(1);
 });

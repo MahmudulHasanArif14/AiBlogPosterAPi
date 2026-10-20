@@ -158,17 +158,38 @@ being published.
 - `CRON_SECRET` authenticates the cron trigger and the admin routes. It is not a
   staff login and must not be used as one.
 
+## Node version
+
+The worker needs **Node 22 or newer**. `@supabase/supabase-js` builds a
+RealtimeClient when the client is constructed and throws on a runtime with no
+global `WebSocket`, which Node 20 does not have. The GitHub Actions workflow
+pins 22; Vercel runs 24.
+
 ## Hosting constraints
 
 This project is on Vercel's **Hobby** plan, which caps a function at 60 seconds
 and allows one cron invocation per day.
 
-Generation therefore runs **inline** in the invoking request via
-`runGenerationJob()` in `src/lib/generation.ts`. There is deliberately no
-internal HTTP hop from the cron to `/api/generate`: waiting on a second
-function's full request budget could never complete inside 60 seconds. The
-OpenRouter call is bounded at 38 seconds so the database still gets its
-completion write.
+Generation measured against the configured reasoning model takes **60-115
+seconds**, so it cannot run in a Vercel function at all. The daily run is a
+plain Node worker, `scripts/generate.ts`, driven by
+`.github/workflows/daily-article.yml`, where there is no time limit.
+`vercel.json` carries an empty `crons` array so the two schedulers cannot both
+fire.
+
+The Vercel routes still share the same `runGenerationJob()` pipeline and remain
+useful for short operator work, but anything that needs a full article should go
+through the workflow.
+
+### Running the workflow by hand
+
+Actions → **Daily article** → Run workflow, then pick a mode:
+
+| Mode | What it does |
+| --- | --- |
+| `daily` | Takes the next rotation slot. What the schedule runs. |
+| `seed` | Generates the five-article initial batch, skipping any location that already has a published article. Safe to re-run. |
+| `location` | Generates one article for the `location` slug you give it, with an optional `topic`. Creates a `manual` job, so the daily slot is untouched. |
 
 The Supabase project is in `ap-northeast-1` while the Vercel functions run in
 `iad1`, so every database round trip carries real latency. Queries that can run
@@ -199,6 +220,14 @@ npm run build
 
 `npm run build` writes to `.next`. To build while `next dev` is running — which
 holds `.next` open on Windows — set `NEXT_DIST_DIR=.next-verify`.
+
+Generation from a terminal (needs Node 22+ and the env in `.env.example`):
+
+```
+npm run generate:daily                       # take the next rotation slot
+npm run generate:one -- --seed               # the five-article initial batch
+npm run generate:one -- --location brighton  # one article for one location
+```
 
 ## Operating it
 
