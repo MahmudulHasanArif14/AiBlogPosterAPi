@@ -200,6 +200,43 @@ describe("checkQuality", () => {
     assert.ok(result.reasons.includes("undeclared_material_claim"));
   });
 
+  test("does not treat ordinary advice mentioning licensing as a claim", () => {
+    // Regression: matching a bare "licensed" made these three sentences count
+    // as material claims, which held a correct article for review.
+    const advice = [
+      "If you book private hire, confirm that the operator is licensed and ask about the likely cost before the journey begins.",
+      "Booking through a licensed operator means you have a record of the journey and a regulated driver.",
+      "By checking station details, campus guidance and licensing rules ahead of time, you can choose the best option.",
+    ].join(" ");
+
+    const result = checkQuality(
+      baseArticle({ content: `${baseArticle().content}
+
+${advice}` }),
+      context(),
+    );
+
+    assert.ok(
+      !result.reasons.includes("undeclared_material_claim"),
+      `unexpected reasons: ${result.reasons}; undeclared: ${JSON.stringify(result.details.undeclaredMaterialSentences)}`,
+    );
+  });
+
+  test("still requires an assertive licensing claim to be declared", () => {
+    const result = checkQuality(
+      baseArticle({
+        content: `${baseArticle().content}
+
+All drivers are licensed by the local council and every vehicle is wheelchair accessible.`,
+        claims: [],
+      }),
+      context(),
+    );
+
+    assert.ok(result.reasons.includes("undeclared_material_claim"));
+    assert.ok(result.details.undeclaredMaterialSentences.length > 0);
+  });
+
   test("blocks an invented station", () => {
     const result = checkQuality(
       baseArticle({

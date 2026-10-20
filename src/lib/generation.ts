@@ -531,7 +531,22 @@ export async function runGenerationJob(
     review_notes:
       uniqueBlocking.length === 0
         ? null
-        : `Blocked by: ${uniqueBlocking.join(", ")}`,
+        : [
+            `Blocked by: ${uniqueBlocking.join(", ")}`,
+            quality.details.undeclaredMaterialSentences.length > 0
+              ? `Undeclared material sentences: ${JSON.stringify(
+                  quality.details.undeclaredMaterialSentences,
+                )}`
+              : null,
+            quality.details.unverifiedClaims.length > 0
+              ? `Unverified claims: ${JSON.stringify(quality.details.unverifiedClaims)}`
+              : null,
+            quality.details.unrecognisedPlaces.length > 0
+              ? `Unrecognised places: ${quality.details.unrecognisedPlaces.join(", ")}`
+              : null,
+          ]
+            .filter(Boolean)
+            .join("\n"),
 
     image_url: image?.image_url ?? null,
     image_alt: image?.image_alt ?? null,
@@ -630,6 +645,7 @@ export async function runGenerationJob(
       verified_claim_count: quality.details.verifiedClaims.length,
       unverified_claims: quality.details.unverifiedClaims,
       unrecognised_places: quality.details.unrecognisedPlaces,
+      undeclared_material_sentences: quality.details.undeclaredMaterialSentences,
       image_found: Boolean(image),
       image_provider: image?.image_provider ?? null,
       image_license: image?.image_license ?? null,
@@ -654,6 +670,7 @@ export async function runGenerationJob(
         maxContentSimilarity: quality.details.maxContentSimilarity,
         unverifiedClaims: quality.details.unverifiedClaims,
         unrecognisedPlaces: quality.details.unrecognisedPlaces,
+        undeclaredMaterialSentences: quality.details.undeclaredMaterialSentences,
       },
       verification,
       image: image

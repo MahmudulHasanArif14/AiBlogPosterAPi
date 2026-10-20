@@ -47,6 +47,9 @@ export type QualityResult = {
     verifiedClaims: { text: string; sourceName: string }[];
     unrecognisedPlaces: string[];
     untrustedCitations: string[];
+    /** Material sentences no declared claim covers, which is why a hold
+        for undeclared_material_claim can be acted on without guessing. */
+    undeclaredMaterialSentences: string[];
   };
 };
 
@@ -121,7 +124,14 @@ const MATERIAL_CLAIM_PATTERNS = [
   /\b\d+(?:\.\d+)?\s*(?:%|per cent|percent)/i,
   /\b\d+\s*(?:seater|seats|passengers|bags|suitcases)\b/i,
   /\b(?:24\/7|around the clock|all night)\b/i,
-  /\b(?:wheelchair[- ]accessible|wheelchair access|DBS|licen[sc]ed|licen[sc]ing|enhanced check)\b/i,
+  // Regulated credentials, but only where the sentence actually asserts
+  // something about them. A bare "a licensed operator" is ordinary travel
+  // prose, not a checkable claim: matching `licen[sc]ed` on its own flagged
+  // advice like "confirm that the operator is licensed" as a material claim
+  // and held good articles for review.
+  /\b(?:wheelchair[- ]accessible|wheelchair access|DBS|enhanced (?:DBS )?check)\b/i,
+  /\b(?:licensing authority|licen[sc]ed by|must be licen[sc]ed|fully licen[sc]ed|licen[sc]e number)\b/i,
+  /\bmust be pre-?booked\b/i,
   /\b(?:fixed[- ]price|fixed fare|meter(?:ed)? fare|flat rate)\b/i,
   /\b(?:every|each)\s+\d+\s*minutes?\b/i,
   /\b(?:opens?|closes?|open|closed)\s+(?:at|from|until)\b/i,
@@ -511,6 +521,7 @@ export function checkQuality(
       verifiedClaims,
       unrecognisedPlaces,
       untrustedCitations,
+      undeclaredMaterialSentences: unmatchedMaterialSentences,
     },
   };
 }
