@@ -9,7 +9,9 @@
     "lint": "eslint .",
     "type-check": "tsc --noEmit",
     "test": "node --import tsx --test tests/quality.test.ts",
-    "verify": "npm run lint && npm run type-check && npm test"
+    "verify": "npm run lint && npm run type-check && npm test",
+    "generate:daily": "tsx scripts/generate.ts --daily",
+    "generate:one": "tsx scripts/generate.ts"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.57.0",

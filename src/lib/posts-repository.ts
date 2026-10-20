@@ -1,18 +1,16 @@
 import { unstable_cache } from "next/cache";
+import { LOCATIONS_CACHE_TAG, POSTS_CACHE_TAG, siteUrl } from "./config";
 import { supabaseAdmin } from "./supabase";
 
-export const POSTS_CACHE_TAG = "posts";
-export const LOCATIONS_CACHE_TAG = "locations";
-
-export const DEFAULT_PAGE_SIZE = 10;
-export const MAX_PAGE_SIZE = 50;
-
-export function siteUrl() {
-  return (process.env.SITE_URL || "https://content.westerncars.com").replace(
-    /\/$/,
-    "",
-  );
-}
+// Re-exported so existing importers keep working; defined in config.ts, which
+// has no Next.js dependency and is therefore usable by the scheduled worker.
+export {
+  POSTS_CACHE_TAG,
+  LOCATIONS_CACHE_TAG,
+  DEFAULT_PAGE_SIZE,
+  MAX_PAGE_SIZE,
+  siteUrl,
+} from "./config";
 
 // Columns the public API is allowed to read. Deliberately excludes
 // review_notes, verified_claims, quality_reasons, quality_score, content_hash

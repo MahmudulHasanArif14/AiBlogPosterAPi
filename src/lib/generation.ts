@@ -1,9 +1,8 @@
 import { createHash } from "node:crypto";
-import { revalidateTag } from "next/cache";
 import { z } from "zod";
 import { ArticleSchema, readingMinutes } from "./article";
+import { AI_REQUEST_TIMEOUT_MS, POSTS_CACHE_TAG, siteUrl } from "./config";
 import { findWikimediaImage } from "./images/wikimedia";
-import { POSTS_CACHE_TAG, siteUrl } from "./posts-repository";
 import { checkQuality, type ApprovedSource } from "./quality";
 import { supabaseAdmin } from "./supabase";
 import { verifySources } from "./verification";
@@ -14,19 +13,17 @@ import { verifySources } from "./verification";
 // killed at 60 seconds, so a cron that waited on a second function's full
 // request budget could never finish.
 
-export const AI_REQUEST_TIMEOUT_MS = 40_000;
-
 // The configured model is a reasoning model: it spends completion tokens
 // thinking before it writes anything. At 4500 the entire budget went to
 // reasoning and the response came back with finish_reason 'length' and an empty
 // content string, which is what made every article fail validation. The budget
-// has to cover reasoning *and* a 600-1200 word article.
+// has to cover reasoning *and* a 650-1000 word article.
 //
-// `reasoning: { effort: "low" }` cuts the thinking down. Note that
-// `reasoning: { exclude: true }` does not help: it only hides reasoning from
-// the response, the tokens are still spent.
+// Measured: ~6000 reasoning + ~1300 content tokens, 60-115 seconds end to end.
+// `reasoning: { effort: "low" }` made it *slower* (113s vs 58s unset), and
+// `reasoning: { exclude: true }` only hides reasoning from the response without
+// saving the tokens. Neither is used.
 const AI_MAX_TOKENS = 10_000;
-const AI_REASONING_EFFORT = "low";
 
 export type GenerationOutcome = {
   httpStatus: number;
@@ -326,7 +323,6 @@ export async function runGenerationJob(
         model,
         temperature: 0.3,
         max_tokens: AI_MAX_TOKENS,
-        reasoning: { effort: AI_REASONING_EFFORT },
         response_format: { type: "json_object" },
         messages: [
           { role: "system", content: buildSystemPrompt() },
@@ -604,9 +600,16 @@ export async function runGenerationJob(
   });
 
   // Clear the cached listings so a newly published article is visible on the
-  // next request rather than after the revalidate window.
+  // next request rather than after the revalidate window. Outside a Next
+  // request context -- the scheduled worker -- this is a no-op, and the worker
+  // calls /api/admin/revalidate instead.
   if (publish) {
-    revalidateTag(POSTS_CACHE_TAG);
+    try {
+      const { revalidateTag } = await import("next/cache");
+      revalidateTag(POSTS_CACHE_TAG);
+    } catch {
+      // Not running inside Next. Expected for the scheduled worker.
+    }
   }
 
   const { error: activityError } = await supabase.from("activity_log").insert({

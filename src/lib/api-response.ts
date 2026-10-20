@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE } from "./posts-repository";
+import { DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE } from "./config";
 
 // Published content is public and immutable enough to cache hard at the edge.
 // New articles appear within s-maxage; revalidateTag clears the data cache
