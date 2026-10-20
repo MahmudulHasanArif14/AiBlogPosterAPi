@@ -66,28 +66,22 @@ export async function POST(req: NextRequest) {
     notes: source.notes,
   }));
 
-  const results = [];
+  // Every curated source is on a different host, so checking them all at once
+  // puts no more load on any one of them than checking them one at a time —
+  // and it has to fit inside the 60-second function budget. A slow host costs
+  // at most one HEAD plus one GET timeout.
+  const results = await Promise.all(
+    CURATED_SOURCES.map(async (source) => {
+      const outcome = await verifySources([source.sourceUrl], asApproved);
+      const check = outcome.checks[0];
 
-  // Sequential in small batches: the goal is a reliable answer, and a burst of
-  // parallel requests is exactly what the bot-protected council sites reject.
-  for (let i = 0; i < CURATED_SOURCES.length; i += 4) {
-    const batch = CURATED_SOURCES.slice(i, i + 4);
-
-    const verified = await Promise.all(
-      batch.map(async (source) => {
-        const outcome = await verifySources([source.sourceUrl], asApproved);
-        const check = outcome.checks[0];
-
-        return {
-          source,
-          status: check?.status ?? null,
-          outcome: check?.outcome ?? "unreachable",
-        };
-      }),
-    );
-
-    results.push(...verified);
-  }
+      return {
+        source,
+        status: check?.status ?? null,
+        outcome: check?.outcome ?? ("unreachable" as const),
+      };
+    }),
+  );
 
   const rows = results.map(({ source, status, outcome }) => {
     // 'restricted' means the host answered but refuses automation. That still
