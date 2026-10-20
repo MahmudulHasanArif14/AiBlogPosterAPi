@@ -61,10 +61,19 @@ const MAX_LOCATION_DENSITY = 0.025;
 const PLACEHOLDER_PATTERNS: [RegExp, string][] = [
   [/lorem ipsum/i, "lorem ipsum"],
   [/\b(?:TODO|TBD|FIXME|XXX)\b/, "todo marker"],
-  [/\[(?:insert|your|add|location|topic|placeholder)[^\]]*\]/i, "square-bracket placeholder"],
+  [
+    /\[(?:insert|your|add|location|topic|placeholder)[^\]]*\]/i,
+    "square-bracket placeholder",
+  ],
   [/\{\{[^}]*\}\}/, "template token"],
-  [/\b(?:as an AI|as a language model|I cannot|I'm unable to|I am unable to)\b/i, "model self-reference"],
-  [/\bhere(?:'s| is) (?:the|your) (?:article|blog post|json)\b/i, "assistant preamble"],
+  [
+    /\b(?:as an AI|as a language model|I cannot|I'm unable to|I am unable to)\b/i,
+    "model self-reference",
+  ],
+  [
+    /\bhere(?:'s| is) (?:the|your) (?:article|blog post|json)\b/i,
+    "assistant preamble",
+  ],
   [/\b(?:Lorem|Ipsum|Example Text|Sample text)\b/, "sample text"],
   [/\.{4,}/, "ellipsis filler"],
   [/\bN\/A\b/, "n/a placeholder"],
@@ -73,12 +82,27 @@ const PLACEHOLDER_PATTERNS: [RegExp, string][] = [
 // Promotional claims an article is never allowed to make on the company's
 // behalf, because none of them can be substantiated by a public source.
 const PROMOTIONAL_PATTERNS: [RegExp, string][] = [
-  [/\b(?:guaranteed|guarantee[sd]?) (?:fixed )?(?:fare|price|arrival|pickup|pick-up)\b/i, "guaranteed fare or arrival"],
+  [
+    /\b(?:guaranteed|guarantee[sd]?) (?:fixed )?(?:fare|price|arrival|pickup|pick-up)\b/i,
+    "guaranteed fare or arrival",
+  ],
   [/\bcheapest (?:taxi|fare|ride|transfer)\b/i, "cheapest claim"],
-  [/\b(?:best|number one|#1|leading|most reliable|most trusted) (?:taxi|cab|transfer|operator|service) (?:in|for|around)\b/i, "superlative market claim"],
-  [/\b100%\s*(?:reliable|guaranteed|on[- ]time|satisfaction)\b/i, "absolute reliability claim"],
-  [/\b(?:never late|always on time|always available)\b/i, "absolute availability claim"],
-  [/\b(?:customer|passenger|client) (?:said|told us|reported)\b/i, "unverifiable testimonial"],
+  [
+    /\b(?:best|number one|#1|leading|most reliable|most trusted) (?:taxi|cab|transfer|operator|service) (?:in|for|around)\b/i,
+    "superlative market claim",
+  ],
+  [
+    /\b100%\s*(?:reliable|guaranteed|on[- ]time|satisfaction)\b/i,
+    "absolute reliability claim",
+  ],
+  [
+    /\b(?:never late|always on time|always available)\b/i,
+    "absolute availability claim",
+  ],
+  [
+    /\b(?:customer|passenger|client) (?:said|told us|reported)\b/i,
+    "unverifiable testimonial",
+  ],
   [/\b(?:five|5)[- ]star review\b/i, "review claim"],
   [/\btestimonial\b/i, "testimonial"],
   [/\b(?:award[- ]winning|voted (?:the )?best)\b/i, "award claim"],
@@ -256,13 +280,19 @@ export function checkQuality(
     reasons.push("meta_description_length");
   }
 
-  if (normaliseForCompare(article.excerpt) === normaliseForCompare(article.title)) {
+  if (
+    normaliseForCompare(article.excerpt) === normaliseForCompare(article.title)
+  ) {
     reasons.push("excerpt_duplicates_title");
   }
 
   // --- Duplication ---------------------------------------------------------
 
-  if (context.existingTitles.some((existing) => normalizeTitle(existing) === title)) {
+  if (
+    context.existingTitles.some(
+      (existing) => normalizeTitle(existing) === title,
+    )
+  ) {
     reasons.push("duplicate_title");
   }
 
@@ -387,10 +417,27 @@ export function checkQuality(
     }
 
     return !declaredVocabularies.some((vocabulary) => {
-      const overlap = sentenceWords.filter((word) => vocabulary.has(word)).length;
+      const overlap = sentenceWords.filter((word) =>
+        vocabulary.has(word),
+      ).length;
       return overlap / sentenceWords.length >= 0.5;
     });
   });
+
+  if (unmatchedMaterialSentences.length > 0) {
+    console.warn(
+      "[quality] Unmatched material sentences:",
+      JSON.stringify(unmatchedMaterialSentences, null, 2),
+    );
+    console.warn(
+      "[quality] Declared claims:",
+      JSON.stringify(
+        article.claims.map((claim) => claim.text),
+        null,
+        2,
+      ),
+    );
+  }
 
   if (materialSentences.length > 0 && article.claims.length === 0) {
     // The body makes checkable claims and the generator declared none, so
@@ -402,7 +449,9 @@ export function checkQuality(
   ) {
     reasons.push("undeclared_material_claim");
   } else if (unmatchedMaterialSentences.length > 0) {
-    warnings.push(`undeclared:${unmatchedMaterialSentences.length} sentence(s)`);
+    warnings.push(
+      `undeclared:${unmatchedMaterialSentences.length} sentence(s)`,
+    );
   }
 
   if (article.claims.length === 0) {
