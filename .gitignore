@@ -16,3 +16,6 @@ build
 local-safety-backups/
 preproduction-review.txt
 *.tsbuildinfo
+.env*
+.next-verify
+supabase/.temp/
