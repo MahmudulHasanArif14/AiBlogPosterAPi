@@ -26,7 +26,7 @@ export type VerificationResult = {
 };
 
 const MAX_SOURCES_CHECKED = 8;
-const REQUEST_TIMEOUT_MS = 8000;
+const REQUEST_TIMEOUT_MS = 6000;
 
 // A browser-like agent, because several official council and transport sites
 // reject obvious automation outright.

@@ -14,7 +14,19 @@ import { verifySources } from "./verification";
 // killed at 60 seconds, so a cron that waited on a second function's full
 // request budget could never finish.
 
-export const AI_REQUEST_TIMEOUT_MS = 38_000;
+export const AI_REQUEST_TIMEOUT_MS = 40_000;
+
+// The configured model is a reasoning model: it spends completion tokens
+// thinking before it writes anything. At 4500 the entire budget went to
+// reasoning and the response came back with finish_reason 'length' and an empty
+// content string, which is what made every article fail validation. The budget
+// has to cover reasoning *and* a 600-1200 word article.
+//
+// `reasoning: { effort: "low" }` cuts the thinking down. Note that
+// `reasoning: { exclude: true }` does not help: it only hides reasoning from
+// the response, the tokens are still spent.
+const AI_MAX_TOKENS = 10_000;
+const AI_REASONING_EFFORT = "low";
 
 export type GenerationOutcome = {
   httpStatus: number;
@@ -313,7 +325,8 @@ export async function runGenerationJob(
       body: JSON.stringify({
         model,
         temperature: 0.3,
-        max_tokens: 4500,
+        max_tokens: AI_MAX_TOKENS,
+        reasoning: { effort: AI_REASONING_EFFORT },
         response_format: { type: "json_object" },
         messages: [
           { role: "system", content: buildSystemPrompt() },
@@ -363,13 +376,49 @@ export async function runGenerationJob(
   }
 
   const payload = await aiResponse.json().catch(() => null);
-  const raw = payload?.choices?.[0]?.message?.content;
+  const choice = payload?.choices?.[0];
+  const raw = choice?.message?.content;
+  const finishReason: string | undefined = choice?.finish_reason;
+  const usage = payload?.usage;
+
+  // A truncated response is a budget problem, not a bad article, and saying so
+  // is the difference between a one-line fix and a long hunt. Reasoning models
+  // hit this by thinking until the token budget is gone.
+  if (finishReason === "length" && (typeof raw !== "string" || raw.trim() === "")) {
+    const reasoningTokens =
+      usage?.completion_tokens_details?.reasoning_tokens ?? "unknown";
+
+    console.error(
+      `provider_output_truncated: finish_reason=length, completion_tokens=${
+        usage?.completion_tokens ?? "unknown"
+      }, reasoning_tokens=${reasoningTokens}, max_tokens=${AI_MAX_TOKENS}`,
+    );
+
+    await failJob(
+      "provider_output_truncated",
+      `finish_reason=length reasoning_tokens=${reasoningTokens} max_tokens=${AI_MAX_TOKENS}`,
+    );
+
+    return {
+      httpStatus: 503,
+      body: {
+        error:
+          "The model used its whole token budget before writing the article. Raise max_tokens or lower the reasoning effort.",
+        code: "provider_output_truncated",
+        finishReason,
+        reasoningTokens,
+        retryable: true,
+      },
+    };
+  }
 
   let article;
 
   try {
-    if (typeof raw !== "string") {
-      throw new Error("provider returned no article content");
+    if (typeof raw !== "string" || raw.trim() === "") {
+      throw new Error(
+        `provider returned no article content (finish_reason=${finishReason ?? "unknown"})`,
+      );
     }
 
     article = ArticleSchema.parse(JSON.parse(raw));
@@ -382,7 +431,13 @@ export async function runGenerationJob(
           }))
         : undefined;
 
-    console.error("article validation failed:", details ?? error);
+    console.error(
+      `article validation failed (finish_reason=${finishReason ?? "unknown"}, completion_tokens=${
+        usage?.completion_tokens ?? "unknown"
+      }, content_length=${typeof raw === "string" ? raw.length : "n/a"}):`,
+      details ?? error,
+    );
+
     await failJob("invalid_article_structure", JSON.stringify(details ?? {}));
 
     return {
@@ -406,7 +461,11 @@ export async function runGenerationJob(
     approvedSources,
   });
 
-  // --- Live provenance check ----------------------------------------------
+  // --- Provenance check and featured image --------------------------------
+  //
+  // Both are network-bound and independent of each other, so they run together.
+  // Sequentially they were the two slowest steps after generation, and the
+  // whole handler has to finish inside 60 seconds.
 
   const declaredSourceUrls = [
     ...article.sources,
@@ -415,17 +474,13 @@ export async function runGenerationJob(
       .filter((url): url is string => typeof url === "string"),
   ];
 
-  const verification = await verifySources(declaredSourceUrls, approvedSources);
-
-  // --- Featured image ------------------------------------------------------
-
-  let image: Awaited<ReturnType<typeof findWikimediaImage>> = null;
-
-  try {
-    image = await findWikimediaImage(loc.name as string, article.title);
-  } catch (error) {
-    console.error("image lookup failed:", error);
-  }
+  const [verification, image] = await Promise.all([
+    verifySources(declaredSourceUrls, approvedSources),
+    findWikimediaImage(loc.name as string, article.title).catch((error) => {
+      console.error("image lookup failed:", error);
+      return null;
+    }),
+  ]);
 
   // --- Publication decision ------------------------------------------------
 
