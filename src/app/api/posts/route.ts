@@ -12,12 +12,32 @@ export async function GET(req: NextRequest) {
   let query = db
     .from("posts")
     .select(
-      "id,title,slug,excerpt,meta_description,canonical_url,published_at,location_id",
+      [
+        "id",
+        "title",
+        "slug",
+        "excerpt",
+        "meta_description",
+        "canonical_url",
+        "published_at",
+        "location_id",
+        "image_url",
+        "image_alt",
+        "image_credit",
+        "image_source_url",
+        "image_provider",
+        "image_mime",
+        "image_width",
+        "image_height",
+        "image_license",
+        "image_license_url",
+      ].join(","),
       { count: "exact" },
     )
     .eq("status", "published")
     .order("published_at", { ascending: false })
     .range((page - 1) * limit, page * limit - 1);
+
   if (location) {
     const { data: loc } = await db
       .from("locations")

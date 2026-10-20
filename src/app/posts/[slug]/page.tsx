@@ -1,4 +1,6 @@
-import { notFound } from "next/navigation";
+﻿import { notFound } from "next/navigation";
+import Link from "next/link";
+import Image from "next/image";
 import { supabaseAdmin } from "@/lib/supabase";
 
 export const revalidate = 60;
@@ -14,21 +16,7 @@ export default async function PostPage({
   const { data: p } = await db
     .from("posts")
     .select(
-      [
-        "title",
-        "slug",
-        "excerpt",
-        "content",
-        "meta_description",
-        "published_at",
-        "canonical_url",
-        "image_url",
-        "image_alt",
-        "image_credit",
-        "image_source_url",
-        "image_license",
-        "image_license_url",
-      ].join(","),
+      "title,slug,excerpt,content,meta_description,published_at,canonical_url,image_url,image_alt,image_credit,image_source_url,image_license,image_license_url",
     )
     .eq("slug", slug)
     .eq("status", "published")
@@ -58,7 +46,7 @@ export default async function PostPage({
         borderRadius: 12,
       }}
     >
-      <a href="/">Western Cars Content Hub</a>
+      <Link href="/">Western Cars Content Hub</Link>
 
       <p style={{ color: "#64748b" }}>
         Published{" "}
@@ -73,7 +61,11 @@ export default async function PostPage({
 
       {p.image_url && (
         <figure style={{ margin: "28px 0" }}>
-          <img
+          <Image
+            width={1200}
+            height={675}
+            sizes="(max-width: 768px) 100vw, 1200px"
+            priority
             src={p.image_url}
             alt={p.image_alt || p.title}
             loading="eager"
@@ -97,11 +89,11 @@ export default async function PostPage({
             }}
           >
             {p.image_credit || "Image creator not specified"}
-            {" · "}
+            {" Â· "}
             {p.image_license || "Licence information"}
             {p.image_license_url && (
               <>
-                {" · "}
+                {" Â· "}
                 <a
                   href={p.image_license_url}
                   target="_blank"
@@ -113,7 +105,7 @@ export default async function PostPage({
             )}
             {p.image_source_url && (
               <>
-                {" · "}
+                {" Â· "}
                 <a
                   href={p.image_source_url}
                   target="_blank"

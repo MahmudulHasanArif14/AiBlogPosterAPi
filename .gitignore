@@ -7,3 +7,12 @@ build
 .env.*.local
 .vercel
 *.log
+
+# Local backups and generated build artifacts
+.env.local.backup*
+.env.local.before-*
+*.backup
+*.before-*
+local-safety-backups/
+preproduction-review.txt
+*.tsbuildinfo

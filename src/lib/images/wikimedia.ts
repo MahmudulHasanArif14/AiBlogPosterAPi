@@ -1,25 +1,23 @@
-const API_URL = "https://commons.wikimedia.org/w/api.php";
-const MIN_WIDTH = 1200;
-const MIN_HEIGHT = 630;
+const PEXELS_API_URL = "https://api.pexels.com/v1/search";
+const PEXELS_LICENSE_URL = "https://www.pexels.com/license/";
 
-type MetadataValue = {
-  value?: string;
+type PexelsPhoto = {
+  id: number;
+  width: number;
+  height: number;
+  url: string;
+  photographer: string;
+  photographer_url: string;
+  src: {
+    original?: string;
+    large2x?: string;
+    large?: string;
+    landscape?: string;
+  };
 };
 
-type ImageInfo = {
-  url?: string;
-  thumburl?: string;
-  mime?: string;
-  width?: number;
-  height?: number;
-  thumbwidth?: number;
-  thumbheight?: number;
-  extmetadata?: Record<string, MetadataValue>;
-};
-
-type CommonsPage = {
-  title?: string;
-  imageinfo?: ImageInfo[];
+type PexelsResponse = {
+  photos?: PexelsPhoto[];
 };
 
 export type FeaturedImage = {
@@ -35,209 +33,176 @@ export type FeaturedImage = {
   image_license_url: string;
 };
 
-function plainText(value?: string): string {
-  return (value || "")
-    .replace(/<[^>]*>/g, " ")
-    .replace(/&nbsp;/gi, " ")
-    .replace(/&#(\d+);/g, (_, n: string) => String.fromCodePoint(Number(n)))
-    .replace(/&#x([0-9a-f]+);/gi, (_, n: string) =>
-      String.fromCodePoint(parseInt(n, 16)),
-    )
-    .replace(/&amp;/g, "&")
-    .replace(/&quot;/g, '"')
-    .replace(/&#39;|&apos;/g, "'")
-    .replace(/&lt;/g, "<")
-    .replace(/&gt;/g, ">")
+function cleanQuery(value: string): string {
+  return value
+    .replace(/[^\p{L}\p{N}\s'-]/gu, " ")
     .replace(/\s+/g, " ")
     .trim()
-    .slice(0, 500);
+    .slice(0, 180);
 }
 
-function allowedImageUrl(value?: string): boolean {
-  if (!value) return false;
+function buildQueries(location: string, topic: string): string[] {
+  const cleanLocation = cleanQuery(location);
+  const cleanTopic = cleanQuery(topic);
 
+  const candidates = [
+    `${cleanTopic} ${cleanLocation}`,
+    `${cleanTopic} ${cleanLocation} travel`,
+    `${cleanLocation} UK`,
+    cleanTopic,
+    `${cleanLocation} landscape`,
+  ];
+
+  return [
+    ...new Set(candidates.map(cleanQuery).filter((query) => query.length > 0)),
+  ];
+}
+
+function isValidPexelsImageUrl(value: string): boolean {
   try {
     const url = new URL(value);
 
     return (
       url.protocol === "https:" &&
-      url.hostname === "upload.wikimedia.org" &&
+      url.hostname === "images.pexels.com" &&
       !url.username &&
       !url.password &&
-      (url.pathname.startsWith("/wikipedia/commons/") ||
-        url.pathname.startsWith("/wikipedia/commons/thumb/"))
+      url.pathname.startsWith("/photos/")
     );
   } catch {
     return false;
   }
 }
 
-function allowedMime(value?: string): boolean {
-  return ["image/jpeg", "image/png", "image/webp"].includes(
-    (value || "").toLowerCase().split(";")[0].trim(),
-  );
-}
-
-function allowedLicense(name: string, licenseUrl: string): boolean {
-  const combined = `${name} ${licenseUrl}`.toLowerCase();
-
-  // Do not use licences with non-commercial or no-derivatives restrictions.
-  if (
-    /\bnon[- ]?commercial\b|\bno derivatives\b|\bby-nc\b|\bby-nd\b|\bcc\s*by-nc\b|\bcc\s*by-nd\b/.test(
-      combined,
-    )
-  ) {
-    return false;
-  }
-
-  // Allow common reusable Creative Commons licences and public-domain works.
+function isValidPexelsPhoto(photo: PexelsPhoto): boolean {
   return (
-    /\bcc0\b/.test(combined) ||
-    /\bpublic domain\b|\bpublic-domain\b/.test(combined) ||
-    /\bcc[- ]?by(?:[- ]?sa)?(?:\s|[-/]|$)/.test(combined) ||
-    /creativecommons\.org\/licenses\/by(?:-sa)?\//.test(combined)
+    Number.isFinite(photo.id) &&
+    photo.id > 0 &&
+    Number.isFinite(photo.width) &&
+    Number.isFinite(photo.height) &&
+    photo.width >= 1200 &&
+    photo.height >= 630 &&
+    photo.width / photo.height >= 1.2 &&
+    photo.width / photo.height <= 2.2 &&
+    typeof photo.photographer === "string" &&
+    photo.photographer.trim().length > 0 &&
+    typeof photo.url === "string" &&
+    /^https:\/\/www\.pexels\.com\/photo\/[a-z0-9-]+\/?$/i.test(photo.url)
   );
-}
-
-async function imageIsReachable(
-  url: string,
-  expectedMime: string,
-): Promise<boolean> {
-  try {
-    const response = await fetch(url, {
-      method: "HEAD",
-      redirect: "manual",
-      signal: AbortSignal.timeout(4000),
-      headers: {
-        "User-Agent": "WesternCarsContentHub/1.0",
-      },
-    });
-
-    // Reject redirects instead of following an untrusted destination.
-    if (!response.ok || response.status >= 300) return false;
-
-    const actualMime = (response.headers.get("content-type") || "")
-      .split(";")[0]
-      .trim()
-      .toLowerCase();
-
-    return allowedMime(actualMime) && actualMime === expectedMime;
-  } catch {
-    return false;
-  }
 }
 
 export async function findWikimediaImage(
   location: string,
   topic: string,
 ): Promise<FeaturedImage | null> {
-  const searchTerm = `${location} ${topic}`
-    .replace(/[^\p{L}\p{N}\s'-]/gu, " ")
-    .replace(/\s+/g, " ")
-    .trim()
-    .slice(0, 180);
+  // Keep this name to preserve existing imports in route.ts.
+  const apiKey = process.env.PEXELS_API_KEY?.trim();
 
-  if (!searchTerm) return null;
-
-  const api = new URL(API_URL);
-  api.search = new URLSearchParams({
-    action: "query",
-    format: "json",
-    formatversion: "2",
-    generator: "search",
-    gsrsearch: `${searchTerm} filetype:bitmap`,
-    gsrnamespace: "6",
-    gsrwhat: "text",
-    gsrlimit: "15",
-    prop: "imageinfo",
-    iiprop: "url|size|mime|extmetadata",
-    iiurlwidth: "1600",
-  }).toString();
-
-  try {
-    const response = await fetch(api, {
-      headers: {
-        "Api-User-Agent":
-          "WesternCarsContentHub/1.0 (https://content.westerncars.co.uk)",
-      },
-      signal: AbortSignal.timeout(8000),
-      cache: "no-store",
-    });
-
-    if (!response.ok) return null;
-
-    const payload = await response.json();
-    const pages: CommonsPage[] = payload?.query?.pages || [];
-
-    const candidates = pages
-      .map((page) => {
-        const info = page.imageinfo?.[0];
-        const metadata = info?.extmetadata || {};
-
-        const license = plainText(metadata.LicenseShortName?.value);
-        const licenseUrl = plainText(metadata.LicenseUrl?.value);
-
-        const imageUrl = info?.thumburl || info?.url;
-        const mime = (info?.mime || "").toLowerCase();
-
-        const width = info?.thumbwidth || info?.width || 0;
-        const height = info?.thumbheight || info?.height || 0;
-
-        if (
-          !page.title ||
-          !allowedImageUrl(imageUrl) ||
-          !allowedMime(mime) ||
-          width < MIN_WIDTH ||
-          height < MIN_HEIGHT ||
-          width / height < 1.2 ||
-          width / height > 2.2 ||
-          !license ||
-          !allowedLicense(license, licenseUrl)
-        ) {
-          return null;
-        }
-
-        const description = plainText(metadata.ImageDescription?.value);
-        const title = plainText(page.title.replace(/^File:/i, ""));
-
-        const artist = plainText(
-          metadata.Artist?.value ||
-            metadata.Credit?.value ||
-            "Creator not specified",
-        );
-
-        return {
-          image_url: imageUrl!,
-          image_alt: (description || title).slice(0, 250),
-          image_credit: artist,
-          image_source_url:
-            "https://commons.wikimedia.org/wiki/" +
-            encodeURIComponent(page.title.replace(/ /g, "_")),
-          image_provider: "Wikimedia Commons",
-          image_mime: mime,
-          image_width: width,
-          image_height: height,
-          image_license: license,
-          image_license_url: licenseUrl,
-        } satisfies FeaturedImage;
-      })
-      .filter((candidate): candidate is FeaturedImage => candidate !== null)
-      .slice(0, 4);
-
-    // Validate candidates concurrently, with a short timeout per image.
-    const checked = await Promise.all(
-      candidates.map(async (candidate) => ({
-        candidate,
-        reachable: await imageIsReachable(
-          candidate.image_url,
-          candidate.image_mime,
-        ),
-      })),
-    );
-
-    return checked.find((item) => item.reachable)?.candidate || null;
-  } catch {
-    // Image search failure must not crash article generation.
+  if (!apiKey) {
+    console.error("PEXELS_API_KEY is not configured.");
     return null;
   }
+
+  const queries = buildQueries(location, topic);
+
+  if (queries.length === 0) {
+    console.warn("No usable Pexels search query was generated.");
+    return null;
+  }
+
+  for (const query of queries) {
+    const url = new URL(PEXELS_API_URL);
+
+    url.search = new URLSearchParams({
+      query,
+      orientation: "landscape",
+      size: "large",
+      per_page: "15",
+    }).toString();
+
+    let response: Response;
+
+    try {
+      response = await fetch(url, {
+        method: "GET",
+        headers: {
+          Authorization: apiKey,
+          Accept: "application/json",
+        },
+        signal: AbortSignal.timeout(8000),
+        next: { revalidate: 86400 },
+      });
+    } catch (error) {
+      console.error(
+        "Pexels request failed:",
+        error instanceof Error ? error.message : "Unknown error",
+      );
+      return null;
+    }
+
+    if (!response.ok) {
+      console.error(
+        "Pexels photo search failed:",
+        response.status,
+        "Query:",
+        query,
+      );
+
+      // Do not continue blindly after authentication, rate-limit,
+      // or other API errors.
+      return null;
+    }
+
+    let payload: PexelsResponse;
+
+    try {
+      payload = (await response.json()) as PexelsResponse;
+    } catch {
+      console.error("Pexels returned invalid JSON.");
+      return null;
+    }
+
+    const photos = Array.isArray(payload.photos) ? payload.photos : [];
+
+    for (const photo of photos) {
+      if (!isValidPexelsPhoto(photo)) {
+        continue;
+      }
+
+      const candidates = [
+        photo.src.landscape,
+        photo.src.large2x,
+        photo.src.large,
+        photo.src.original,
+      ];
+
+      const imageUrl = candidates.find(
+        (candidate): candidate is string =>
+          typeof candidate === "string" && isValidPexelsImageUrl(candidate),
+      );
+
+      if (!imageUrl) {
+        continue;
+      }
+
+      return {
+        image_url: imageUrl,
+        image_alt: `${location}: ${topic} — photo by ${photo.photographer}`,
+        image_credit: `Photo by ${photo.photographer} on Pexels`,
+        image_source_url: photo.url,
+        image_provider: "Pexels",
+        image_mime: "image/jpeg",
+        image_width: photo.width,
+        image_height: photo.height,
+        image_license: "Pexels License",
+        image_license_url: PEXELS_LICENSE_URL,
+      };
+    }
+
+    console.warn("No suitable Pexels photos for query:", query);
+  }
+
+  console.warn("Pexels returned no suitable image for the topic and location.");
+
+  return null;
 }
