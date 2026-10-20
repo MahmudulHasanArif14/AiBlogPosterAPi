@@ -1,5 +1,7 @@
 const PEXELS_API_URL = "https://api.pexels.com/v1/search";
 const PEXELS_LICENSE_URL = "https://www.pexels.com/license/";
+const MAX_QUERIES = 2;
+const REQUEST_TIMEOUT_MS = 6000;
 
 type PexelsPhoto = {
   id: number;
@@ -53,9 +55,11 @@ function buildQueries(location: string, topic: string): string[] {
     `${cleanLocation} landscape`,
   ];
 
+  // Capped: each query is a separate network round trip, and the caller has a
+  // 60-second budget to share with generation and source verification.
   return [
     ...new Set(candidates.map(cleanQuery).filter((query) => query.length > 0)),
-  ];
+  ].slice(0, MAX_QUERIES);
 }
 
 function isValidPexelsImageUrl(value: string): boolean {
@@ -129,7 +133,7 @@ export async function findWikimediaImage(
           Authorization: apiKey,
           Accept: "application/json",
         },
-        signal: AbortSignal.timeout(8000),
+        signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
         next: { revalidate: 86400 },
       });
     } catch (error) {

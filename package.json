@@ -6,7 +6,12 @@
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
-    "lint": "eslint ."
+    "lint": "eslint .",
+    "type-check": "tsc --noEmit",
+    "test": "node --import tsx --test tests/quality.test.ts",
+    "verify": "npm run lint && npm run type-check && npm test",
+    "generate:daily": "tsx scripts/generate.ts --daily",
+    "generate:one": "tsx scripts/generate.ts"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.57.0",
@@ -24,6 +29,7 @@
     "eslint": "^9",
     "eslint-config-next": "^15.5.28",
     "tailwindcss": "^4",
+    "tsx": "^4.19.2",
     "typescript": "^5"
   }
 }

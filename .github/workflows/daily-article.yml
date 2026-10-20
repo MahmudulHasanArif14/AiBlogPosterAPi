@@ -1,0 +1,68 @@
+name: Daily article
+
+# One article per day, platform-wide, rotating through the enabled locations.
+#
+# This runs here rather than on a Vercel cron because generation takes 60-115
+# seconds against the configured reasoning model, and the project's Vercel plan
+# kills a function at 60 seconds. GitHub Actions has no such ceiling.
+#
+# The schedule is UTC, as all cron schedules are. The *slot* is keyed on the
+# Europe/London calendar date in Postgres, so a BST transition can neither
+# double-book a London day nor skip one. 03:10 UTC is 03:10 GMT or 04:10 BST,
+# both comfortably inside the same London day.
+
+on:
+  schedule:
+    - cron: "10 3 * * *"
+  workflow_dispatch:
+    inputs:
+      location:
+        description: "Generate for one location instead of taking the daily slot (slug, e.g. brighton)"
+        required: false
+        type: string
+      topic:
+        description: "Optional topic brief for that location"
+        required: false
+        type: string
+
+# Never let two runs generate at once. The database would reject the duplicate,
+# but failing here is clearer than relying on that.
+concurrency:
+  group: daily-article
+  cancel-in-progress: false
+
+jobs:
+  generate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    env:
+      NEXT_PUBLIC_SUPABASE_URL: ${{ secrets.NEXT_PUBLIC_SUPABASE_URL }}
+      SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+      OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+      OPENROUTER_MODEL: ${{ vars.OPENROUTER_MODEL || 'nvidia/nemotron-3.5-super-vl:free' }}
+      PEXELS_API_KEY: ${{ secrets.PEXELS_API_KEY }}
+      CRON_SECRET: ${{ secrets.CRON_SECRET }}
+      SITE_URL: ${{ vars.SITE_URL || 'https://content.westerncars.com' }}
+      AUTO_PUBLISH_ENABLED: ${{ vars.AUTO_PUBLISH_ENABLED || 'false' }}
+      # Generous: the worker has no function time limit here, and a slow
+      # provider response is better waited out than retried tomorrow.
+      AI_REQUEST_TIMEOUT_MS: "240000"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+
+      - run: npm ci
+
+      - name: Generate today's article
+        run: |
+          if [ -n "${{ inputs.location }}" ]; then
+            npm run generate:one -- --location "${{ inputs.location }}" ${{ inputs.topic && format('--topic "{0}"', inputs.topic) || '' }}
+          else
+            npm run generate:daily
+          fi
