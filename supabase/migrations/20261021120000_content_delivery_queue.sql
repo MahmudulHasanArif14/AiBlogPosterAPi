@@ -82,7 +82,13 @@ ALTER TABLE public.content_deliveries ENABLE ROW LEVEL SECURITY;
 
 -- No policies: this is operational state reached only through the service-role
 -- key on the server. anon and authenticated get nothing.
-REVOKE ALL ON public.content_deliveries FROM anon, authenticated;
+REVOKE ALL ON TABLE public.content_deliveries FROM anon, authenticated;
+
+-- Granted explicitly rather than left to Supabase's default privileges on the
+-- public schema. /api/admin/deliveries reads and updates this table directly
+-- rather than through an RPC, so the service role needs table privileges and
+-- not merely EXECUTE on the functions below.
+GRANT ALL ON TABLE public.content_deliveries TO service_role;
 
 COMMENT ON TABLE public.content_deliveries IS
     'Durable outbox of publication notifications owed to each location website. One row per (post, event). Secrets are not stored here.';
@@ -428,15 +434,44 @@ AS $function$
     FROM public.content_deliveries;
 $function$;
 
+-- ---------------------------------------------------------------------------
+-- 7. Least-privilege access
+-- ---------------------------------------------------------------------------
+--
+-- PUBLIC has to be named here, not just anon and authenticated.
+--
+-- Postgres grants EXECUTE to PUBLIC on every new function, and revoking from
+-- anon does NOT take away a privilege anon holds *through* PUBLIC. Every
+-- function below is SECURITY DEFINER and lives in the public schema, so
+-- PostgREST exposes it at /rest/v1/rpc/<name>: leaving the PUBLIC grant in
+-- place would let the anon key call them, bypassing the table privileges
+-- above entirely. Three of them mutate the queue, and delivery_health leaks
+-- queue counts. This is the same privilege-escalation path the scheduling
+-- functions in 20261020190100 are guarded against, guarded the same way.
+--
+-- The GRANTs are therefore not optional. Revoking from PUBLIC without them
+-- would strip the application's own access and break every delivery.
+
 REVOKE ALL ON FUNCTION public.enqueue_content_delivery(uuid, text, text)
-    FROM anon, authenticated;
+    FROM PUBLIC, anon, authenticated;
 REVOKE ALL ON FUNCTION public.claim_content_deliveries(integer, timestamptz, integer)
-    FROM anon, authenticated;
+    FROM PUBLIC, anon, authenticated;
 REVOKE ALL ON FUNCTION public.mark_delivery_result(uuid, boolean, integer, text, timestamptz)
-    FROM anon, authenticated;
+    FROM PUBLIC, anon, authenticated;
 REVOKE ALL ON FUNCTION public.reconcile_content_deliveries(timestamptz, integer, text)
-    FROM anon, authenticated;
+    FROM PUBLIC, anon, authenticated;
 REVOKE ALL ON FUNCTION public.delivery_health(timestamptz)
-    FROM anon, authenticated;
+    FROM PUBLIC, anon, authenticated;
+
+GRANT EXECUTE ON FUNCTION public.enqueue_content_delivery(uuid, text, text)
+    TO service_role;
+GRANT EXECUTE ON FUNCTION public.claim_content_deliveries(integer, timestamptz, integer)
+    TO service_role;
+GRANT EXECUTE ON FUNCTION public.mark_delivery_result(uuid, boolean, integer, text, timestamptz)
+    TO service_role;
+GRANT EXECUTE ON FUNCTION public.reconcile_content_deliveries(timestamptz, integer, text)
+    TO service_role;
+GRANT EXECUTE ON FUNCTION public.delivery_health(timestamptz)
+    TO service_role;
 
 COMMIT;
