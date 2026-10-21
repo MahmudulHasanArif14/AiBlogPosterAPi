@@ -1,0 +1,89 @@
+name: Deliver content
+
+# The scheduled fallback that reconciles published articles against delivery
+# state and sends anything outstanding.
+#
+# WHY THIS IS HERE AND NOT ONLY IN vercel.json
+# --------------------------------------------
+# vercel.json also declares this task on */10. On Vercel's Hobby plan a cron
+# runs at most once per day, so that declaration only takes effect once the
+# project is on Pro. This workflow is what actually runs the task every ten
+# minutes today. Both point at the same endpoint and the endpoint is idempotent,
+# so when the project moves to Pro you can delete this workflow — or leave it,
+# and the two just share the work.
+#
+# GitHub's scheduled triggers are best-effort: a run can be delayed by several
+# minutes under load, and runs can be skipped entirely on a repository with no
+# recent activity. That is acceptable precisely because this is the fallback.
+# A delayed pass delays a notification; it does not lose one, because the
+# reconciler re-derives outstanding work from the database every time rather
+# than from a cursor it advanced last run.
+
+on:
+  schedule:
+    # Every ten minutes, inside the 5-15 minute requirement.
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+
+# A delayed run must not overlap the next one. The endpoint is safe under
+# concurrency anyway (SKIP LOCKED plus a lease), but queueing is clearer than
+# relying on that.
+concurrency:
+  group: deliver-content
+  cancel-in-progress: false
+
+jobs:
+  deliver:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Trigger the delivery pass
+        env:
+          # The deployed content platform's origin, e.g.
+          # https://content.westerncars.com. Set as a repository variable so it
+          # is not hardcoded to one deployment.
+          CONTENT_API_ORIGIN: ${{ vars.CONTENT_API_ORIGIN }}
+          CRON_SECRET: ${{ secrets.CRON_SECRET }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${CONTENT_API_ORIGIN:-}" ]; then
+            echo "CONTENT_API_ORIGIN repository variable is not set." >&2
+            exit 1
+          fi
+
+          if [ -z "${CRON_SECRET:-}" ]; then
+            echo "CRON_SECRET repository secret is not set." >&2
+            exit 1
+          fi
+
+          # --fail-with-body so a non-2xx both fails the step and shows why.
+          # The secret goes in a header, never in the URL, so it cannot end up
+          # in a redirect, an access log or this run's log.
+          response=$(curl --silent --show-error --fail-with-body \
+            --max-time 120 \
+            --retry 2 --retry-delay 5 --retry-connrefused \
+            -H "Authorization: Bearer ${CRON_SECRET}" \
+            -H "Accept: application/json" \
+            "${CONTENT_API_ORIGIN%/}/api/cron/deliver")
+
+          echo "$response"
+
+          # Surface recovered-by-reconciler counts in the step summary, so a
+          # pattern of missed webhooks is visible without reading Vercel logs.
+          recovered=$(printf '%s' "$response" \
+            | grep -o '"recovered":[0-9]*' | head -1 | cut -d: -f2 || true)
+
+          {
+            echo "### Content delivery pass"
+            echo ""
+            echo '```json'
+            printf '%s\n' "$response"
+            echo '```'
+            if [ -n "${recovered:-}" ] && [ "${recovered}" != "0" ]; then
+              echo ""
+              echo ":warning: The reconciler recovered ${recovered} missed delivery/deliveries."
+              echo "Immediate webhook enqueueing may not be working; check the publish path."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"

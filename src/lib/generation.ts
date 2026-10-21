@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { z } from "zod";
 import { ArticleSchema, readingMinutes } from "./article";
 import { AI_REQUEST_TIMEOUT_MS, POSTS_CACHE_TAG, siteUrl } from "./config";
+import { enqueueDelivery } from "./delivery";
 import { findWikimediaImage } from "./images/wikimedia";
 import { checkQuality, type ApprovedSource } from "./quality";
 import { supabaseAdmin } from "./supabase";
@@ -618,6 +619,9 @@ export async function runGenerationJob(
   // next request rather than after the revalidate window. Outside a Next
   // request context -- the scheduled worker -- this is a no-op, and the worker
   // calls /api/admin/revalidate instead.
+  let delivery: { ok: boolean; deliveryId?: string; error?: string } | null =
+    null;
+
   if (publish) {
     try {
       const { revalidateTag } = await import("next/cache");
@@ -625,6 +629,15 @@ export async function runGenerationJob(
     } catch {
       // Not running inside Next. Expected for the scheduled worker.
     }
+
+    // Record that the location's website is owed a notification. This writes a
+    // queue row and nothing more: no HTTP request is made on the generation
+    // path, because generation already takes 60-115 seconds and must not also
+    // wait on someone else's website.
+    //
+    // enqueueDelivery never throws. If this fails, the article is still
+    // published and the scheduled reconciler picks it up within one interval.
+    delivery = await enqueueDelivery(supabase, post.id as string, "published");
   }
 
   const { error: activityError } = await supabase.from("activity_log").insert({
@@ -649,6 +662,8 @@ export async function runGenerationJob(
       image_found: Boolean(image),
       image_provider: image?.image_provider ?? null,
       image_license: image?.image_license ?? null,
+      delivery_enqueued: delivery?.ok ?? null,
+      delivery_id: delivery?.deliveryId ?? null,
     },
   });
 
@@ -661,6 +676,9 @@ export async function runGenerationJob(
     body: {
       post,
       published: publish,
+      // Surfaced so the worker's log says whether distribution was queued, not
+      // just whether the article published.
+      delivery,
       quality: {
         score: postData.quality_score,
         pass: uniqueBlocking.length === 0,
