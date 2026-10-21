@@ -1,23 +1,32 @@
 name: Deliver content
 
-# The scheduled fallback that reconciles published articles against delivery
-# state and sends anything outstanding.
+# THE scheduler for content delivery. Reconciles published articles against
+# delivery state and sends anything outstanding.
 #
-# WHY THIS IS HERE AND NOT ONLY IN vercel.json
+# WHY THIS IS A WORKFLOW AND NOT A VERCEL CRON
 # --------------------------------------------
-# vercel.json also declares this task on */10. On Vercel's Hobby plan a cron
-# runs at most once per day, so that declaration only takes effect once the
-# project is on Pro. This workflow is what actually runs the task every ten
-# minutes today. Both point at the same endpoint and the endpoint is idempotent,
-# so when the project moves to Pro you can delete this workflow — or leave it,
-# and the two just share the work.
+# Vercel's Hobby plan allows a cron to run at most once per day, and it does
+# not merely ignore a more frequent schedule - it rejects the deployment:
 #
+#   "Hobby accounts are limited to daily cron jobs. This cron expression
+#    (*/10 * * * *) would run more than once per day."
+#
+# So vercel.json keeps an empty "crons": [] array, as it already did for the
+# daily generation run, and all scheduling lives here.
+#
+# BECAUSE THIS IS THE ONLY SCHEDULER, ITS LIMITS ARE THE SYSTEM'S LIMITS
+# ---------------------------------------------------------------------
 # GitHub's scheduled triggers are best-effort: a run can be delayed by several
-# minutes under load, and runs can be skipped entirely on a repository with no
-# recent activity. That is acceptable precisely because this is the fallback.
-# A delayed pass delays a notification; it does not lose one, because the
-# reconciler re-derives outstanding work from the database every time rather
-# than from a cursor it advanced last run.
+# minutes under load, and scheduled workflows are disabled automatically after
+# 60 days without repository activity. There is no second scheduler behind this
+# one, so if it stops, delivery stops.
+#
+# What makes that tolerable is the shape of the work, not a backup: the
+# reconciler re-derives outstanding work from the database on every pass rather
+# than advancing a cursor, so a delayed or skipped run delays a notification
+# without losing one, and the next pass picks up everything still outstanding.
+# published_without_delivery in the health block is the number to watch - if it
+# stays non-zero, this workflow is not getting through.
 
 on:
   schedule:

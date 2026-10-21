@@ -87,21 +87,35 @@ state for the twelve locations that have no website yet.
 
 ## Scheduling
 
-The task must run every 5-15 minutes. It is declared twice:
+The task must run every 5-15 minutes, and it is scheduled in exactly one
+place: `.github/workflows/deliver-content.yml`, on `*/10 * * * *`.
 
-- `vercel.json` declares `/api/cron/deliver` on `*/10 * * * *`. **On Vercel's
-  Hobby plan a cron runs at most once per day**, so this only takes effect once
-  the project is on Pro.
-- `.github/workflows/deliver-content.yml` calls the same endpoint every ten
-  minutes. This is what actually runs today.
+**There is deliberately no Vercel cron.** `vercel.json` keeps an empty
+`"crons": []`, matching what the daily generation run already does. Vercel's
+Hobby plan allows a cron to run at most once per day and does not merely ignore
+a more frequent schedule - it rejects the deployment outright:
 
-Both hit the same idempotent endpoint, so running under both is harmless. When
-the project moves to Pro, the workflow can be deleted or left in place.
+> Hobby accounts are limited to daily cron jobs. This cron expression
+> (`*/10 * * * *`) would run more than once per day.
 
-GitHub's scheduled triggers are best-effort and can be delayed. That is
-tolerable here because the reconciler re-derives outstanding work from the
-database on every pass rather than advancing a cursor: a late run delays a
-notification, it does not lose one.
+So a cron entry there is not a harmless second declaration; it is a broken
+deploy. If the project ever moves to Pro, moving the schedule back would be a
+deliberate choice, not something that needs doing.
+
+Two consequences of the workflow being the only scheduler:
+
+- **It only runs from the default branch.** A scheduled workflow on a feature
+  branch never fires. Nothing is delivered until the workflow is on `main`.
+- **Its limits are the system's limits.** GitHub's scheduled triggers are
+  best-effort, can be delayed several minutes under load, and are disabled
+  automatically after 60 days without repository activity. There is no second
+  scheduler behind this one.
+
+That is tolerable because the reconciler re-derives outstanding work from the
+database on every pass rather than advancing a cursor: a late or skipped run
+delays a notification, it does not lose one, and the next pass picks up
+everything still outstanding. `published_without_delivery` staying non-zero is
+the signal that the workflow is not getting through.
 
 ## Operating it
 
