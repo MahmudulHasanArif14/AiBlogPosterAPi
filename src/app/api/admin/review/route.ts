@@ -6,6 +6,7 @@ import {
   POSTS_CACHE_TAG,
   siteUrl,
 } from "@/lib/config";
+import { enqueueDelivery } from "@/lib/delivery";
 import { supabaseAdmin } from "@/lib/supabase";
 
 export const runtime = "nodejs";
@@ -286,11 +287,20 @@ export async function POST(req: NextRequest) {
   revalidateTag(POSTS_CACHE_TAG);
   revalidateTag(LOCATIONS_CACHE_TAG);
 
+  // A manual publication is a publication: the location's website is owed the
+  // same notification as an automatic one. Both publish paths enqueue, so
+  // distribution does not depend on which route published the article.
+  const delivery = await enqueueDelivery(db, post.id as string, "published");
+
   return NextResponse.json({
     slug: updated.slug,
     status: updated.status,
     published_at: updated.published_at,
     url: updated.canonical_url,
     overrodeReasons: reasons,
+    // Queued, not sent. The scheduled dispatcher performs the request; a
+    // failure here is recovered by the reconciler rather than reported as a
+    // failed publication.
+    delivery,
   });
 }
