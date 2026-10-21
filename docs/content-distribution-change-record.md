@@ -61,6 +61,14 @@ A location with no URL/secret pair is skipped quietly — the correct state for 
 
 ## Caveat on the scheduler
 
-**On Vercel's Hobby plan a cron runs at most once per day**, so `vercel.json` only meets the 5–15 minute requirement once the project is on Pro. The GitHub Actions workflow is what actually runs — but scheduled workflows only fire from the default branch, so **it will not run until this merges**. GitHub's schedules are also best-effort; that is tolerable here because the reconciler re-derives outstanding work from the database on every pass, so a late run delays a notification rather than losing one.
+The merged branch declared the task in two places: `vercel.json` on `*/10 * * * *` and the GitHub Actions workflow on the same schedule, on the theory that the Vercel entry would take effect after a Pro upgrade.
+
+**That was wrong, and it was corrected immediately after merge.** Vercel's Hobby plan does not ignore a sub-daily cron expression — it refuses the deployment:
+
+> Hobby accounts are limited to daily cron jobs. This cron expression (`*/10 * * * *`) would run more than once per day.
+
+So `vercel.json` is back to the empty `"crons": []` it already held for the daily generation run, and the GitHub workflow is the only scheduler. See `docs/content-distribution.md` for the current arrangement.
+
+Two consequences of that, both still true: a scheduled workflow fires **only from the default branch**, so nothing was delivered until this merged; and GitHub's schedules are best-effort and are disabled after 60 days of repository inactivity, with no second scheduler behind them. Tolerable because the reconciler re-derives outstanding work from the database on every pass, so a late or skipped run delays a notification rather than losing one.
 
 > On discovery: the sitemap, internal links and a valid feed make these pages discoverable. None of them, and no amount of revalidation, guarantees that Google indexes a page or how it ranks.
