@@ -78,8 +78,8 @@ function buildSystemPrompt() {
     "",
     "Hard rules:",
     "- content is plain text. No HTML, no markdown headings, no bullet characters.",
-    "- Use clear paragraphs separated by blank lines. Aim for 3–6 paragraphs;",
-    "- paragraph formatting is not a reason to reject otherwise useful content.",
+    "- Use clear paragraphs separated by blank lines. Aim for 4–6 paragraphs,",
+    "  each covering a distinct part of the reader's problem.",
     "- content is between 600 and 1200 words. Avoid padding.",
     "- Never put a URL inside content. Cite sources only in the sources array.",
     "- sources must contain only URLs copied exactly from the approvedSources list you are given.",
@@ -434,12 +434,16 @@ export async function runGenerationJob(
     (item) => item.location === loc.slug,
   );
 
-  if (
-    !locationTopicConfig ||
-    !Array.isArray(locationTopicConfig.topicAngles) ||
-    locationTopicConfig.topicAngles.length === 0 ||
-    SHARED_TOPIC_ANGLES.length === 0
-  ) {
+  // Lengths are read as plain numbers so a const-typed empty array still
+  // trips this guard instead of being narrowed away at compile time.
+  const locationAngleCount: number = Array.isArray(
+    locationTopicConfig?.topicAngles,
+  )
+    ? locationTopicConfig.topicAngles.length
+    : 0;
+  const sharedAngleCount: number = SHARED_TOPIC_ANGLES.length;
+
+  if (!locationTopicConfig || locationAngleCount === 0 || sharedAngleCount === 0) {
     console.error(`Missing topic configuration for location: ${loc.slug}`);
 
     return {

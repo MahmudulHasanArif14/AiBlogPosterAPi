@@ -91,13 +91,13 @@ export const AI_MAX_TOKENS = intEnv("AI_MAX_TOKENS", 32_000, 2_000, 200_000);
  */
 export const MIN_ARTICLE_QUALITY_SCORE = intEnv(
   "MIN_ARTICLE_QUALITY_SCORE",
-  50,
+  85,
   0,
   100,
 );
 
 /** Content revisions attempted in one processing cycle. */
-export const MAX_QUALITY_REVISIONS = intEnv("MAX_QUALITY_REVISIONS", 2, 0, 20);
+export const MAX_QUALITY_REVISIONS = intEnv("MAX_QUALITY_REVISIONS", 5, 0, 20);
 
 /**
  * Retries for *provider* failures (rate limits, timeouts, malformed output).
