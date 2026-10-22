@@ -422,6 +422,8 @@ export async function runGenerationJob(
     .maybeSingle();
 
   if (existingError) {
+    console.error("existing article lookup failed:", existingError.message);
+
     return {
       httpStatus: 500,
       body: {
