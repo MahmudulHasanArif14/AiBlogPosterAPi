@@ -21,18 +21,7 @@ export function siteUrl() {
   );
 }
 
-// How long to wait for the article-generation request.
-//
-// Measured against the configured reasoning model: a full article costs roughly
-// 6000 reasoning tokens plus 1300 content tokens and takes 60-115 seconds. That
-// does not fit Vercel's Hobby 60-second function limit, which is why the daily
-// run is a GitHub Actions worker and the in-request endpoints are a fallback
-// for short jobs only.
-export const AI_REQUEST_TIMEOUT_MS = Number(
-  process.env.AI_REQUEST_TIMEOUT_MS ?? 45_000,
-);
-
-// --- Quality improvement loop -------------------------------------------
+// --- Provider and quality improvement loop ------------------------------
 //
 // Validated at module load: a misconfigured threshold would otherwise either
 // publish unchecked articles or spend the provider budget on a target nothing
@@ -56,6 +45,41 @@ function intEnv(name: string, fallback: number, min: number, max: number) {
 
   return value;
 }
+
+/**
+ * How long to wait for a single article-generation request.
+ *
+ * Measured against the configured reasoning model: a full article costs roughly
+ * 6000 reasoning tokens plus 1300 content tokens and takes 60-115 seconds. That
+ * does not fit Vercel's Hobby 60-second function limit, which is why the daily
+ * run is a GitHub Actions worker and the in-request endpoints are a fallback
+ * for short jobs only. The worker raises this via the environment; the default
+ * stays inside what a short in-request job can survive.
+ *
+ * Validated rather than coerced: `Number(undefined-ish)` yields NaN, and a NaN
+ * timeout makes `AbortSignal.timeout` throw on every provider call while a NaN
+ * `minCallBudgetMs` makes every budget comparison false, so the loop would
+ * start calls it has no time to finish.
+ */
+export const AI_REQUEST_TIMEOUT_MS = intEnv(
+  "AI_REQUEST_TIMEOUT_MS",
+  45_000,
+  5_000,
+  900_000,
+);
+
+/**
+ * Completion-token ceiling for one provider call.
+ *
+ * The configured model is a reasoning model, so this budget has to cover
+ * thinking *and* a 650-1000 word article. Reasoning spend is variable, not
+ * fixed: at 10_000 runs have burned the entire budget on reasoning (empty
+ * content, finish_reason 'length') or stopped mid-JSON partway through the
+ * article, failing the job outright. It is a ceiling rather than a spend —
+ * unused tokens are not billed — so it sits well above the worst observed
+ * reasoning burn plus a full article.
+ */
+export const AI_MAX_TOKENS = intEnv("AI_MAX_TOKENS", 32_000, 2_000, 200_000);
 
 /**
  * The score an article must reach to be eligible for publication.

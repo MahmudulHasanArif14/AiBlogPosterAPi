@@ -1,11 +1,19 @@
 import { createHash } from "node:crypto";
 import { z } from "zod";
-import { ArticleSchema, readingMinutes, type Article } from "./article";
 import {
+  ARTICLE_JSON_SCHEMA,
+  ArticleSchema,
+  normaliseArticlePayload,
+  readingMinutes,
+  type Article,
+} from "./article";
+import {
+  AI_MAX_TOKENS,
   AI_REQUEST_TIMEOUT_MS,
   MAX_ARTICLE_REVISION_AGE_HOURS,
   MIN_ARTICLE_QUALITY_SCORE,
   POSTS_CACHE_TAG,
+  QUALITY_CYCLE_BUDGET_MS,
   siteUrl,
 } from "./config";
 import { enqueueDelivery } from "./delivery";
@@ -36,17 +44,11 @@ import { verifySources } from "./verification";
 // the resume semantics live in ./revision; this module supplies the provider,
 // the evaluator and the persistence.
 
-// The configured model is a reasoning model: it spends completion tokens
-// thinking before it writes anything. At 4500 the entire budget went to
-// reasoning and the response came back with finish_reason 'length' and an empty
-// content string, which is what made every article fail validation. The budget
-// has to cover reasoning *and* a 650-1000 word article.
-//
-// Measured: ~6000 reasoning + ~1300 content tokens, 60-115 seconds end to end.
-// `reasoning: { effort: "low" }` made it *slower* (113s vs 58s unset), and
-// `reasoning: { exclude: true }` only hides reasoning from the response without
-// saving the tokens. Neither is used.
-const AI_MAX_TOKENS = 10_000;
+// The token budget lives in ./config with the other validated env knobs.
+// Measured against the configured reasoning model: ~6000 reasoning + ~1300
+// content tokens, 60-115 seconds end to end. `reasoning: { effort: "low" }`
+// made it *slower* (113s vs 58s unset), and `reasoning: { exclude: true }` only
+// hides reasoning from the response without saving the tokens. Neither is used.
 
 export type GenerationOutcome = {
   httpStatus: number;
@@ -105,7 +107,9 @@ function buildSystemPrompt() {
     "  testimonials, reviews, awards or legal claims.",
     "- Never make a superlative or guarantee claim about any operator: no cheapest,",
     "  best, fastest, award-winning, guaranteed fare, always on time, 100% reliable.",
-    "- metaDescription is between 100 and 160 characters.",
+    "- metaDescription must be between 100 and 160 characters. Aim for 140-155",
+    "  characters: 160 is a hard limit and overrunning it fails the article.",
+    "  Count the characters before returning it.",
     "- title is between 25 and 100 characters and must not repeat or closely",
     "  paraphrase any title in recentArticleTitles.",
     "- slug is lowercase, hyphen-separated, derived from the title.",
@@ -212,19 +216,51 @@ export function buildRevisionPrompt(
 // --- Provider adapter ------------------------------------------------------
 
 /**
+ * Whether the provider has accepted schema-constrained output.
+ *
+ * OpenRouter advertises `structured_outputs` for the configured model, but the
+ * backing provider for a given request is the one that has to honour it. A
+ * rejection is therefore a capability discovery, not a job failure: the call is
+ * retried immediately in plain JSON mode and the process stops asking. That
+ * keeps the stronger constraint when it works without making the pipeline
+ * depend on it.
+ */
+let schemaModeSupported = true;
+
+/**
+ * True when a 4xx body names the *response format* rather than the request.
+ *
+ * Deliberately narrow. An earlier version also matched a bare "schema", which
+ * any number of unrelated validation errors mention -- that would have turned
+ * a real rejection into a silent capability downgrade and hidden the actual
+ * error behind a second request. Only wording that names the response format
+ * itself counts.
+ */
+function rejectsResponseFormat(body: string) {
+  return /response_format|json[_ ]schema|structured[_ ]outputs?/i.test(body);
+}
+
+export function resetSchemaModeForTests() {
+  schemaModeSupported = true;
+}
+
+/**
  * One provider call, classified for the retry policy.
  *
  * `permanent` covers the errors retrying cannot fix — bad credentials, a
  * rejected request, a model that does not exist. Everything else (rate limits,
  * 5xx, timeouts, truncated or unparseable output) is transient and gets a
  * bounded, jittered retry.
+ *
+ * Exported so the adapter can be tested against a stubbed `fetch`.
  */
-async function requestArticle(
+export async function requestArticle(
   userPrompt: string,
   model: string,
   key: string,
 ): Promise<ProviderResult> {
   let response: Response;
+  const useSchema = schemaModeSupported;
 
   try {
     response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
@@ -239,7 +275,9 @@ async function requestArticle(
         model,
         temperature: 0.3,
         max_tokens: AI_MAX_TOKENS,
-        response_format: { type: "json_object" },
+        response_format: useSchema
+          ? { type: "json_schema", json_schema: ARTICLE_JSON_SCHEMA }
+          : { type: "json_object" },
         messages: [
           { role: "system", content: buildSystemPrompt() },
           { role: "user", content: userPrompt },
@@ -270,6 +308,26 @@ async function requestArticle(
       response.status !== 408 &&
       response.status !== 409;
 
+    // One exception: a 4xx that names the response format is the provider
+    // declining schema-constrained output, not declining the article. The
+    // capability is switched off and the call is made again in plain JSON
+    // mode, so a provider that cannot constrain output degrades to the old
+    // behaviour instead of failing the job.
+    if (permanent && useSchema) {
+      const body = await response.text().catch(() => "");
+
+      if (rejectsResponseFormat(body)) {
+        schemaModeSupported = false;
+
+        console.warn(
+          `provider rejected json_schema response format (HTTP ${response.status}); ` +
+            "falling back to json_object for the rest of this process",
+        );
+
+        return requestArticle(userPrompt, model, key);
+      }
+    }
+
     return {
       ok: false,
       kind: permanent ? "permanent" : "transient",
@@ -284,25 +342,40 @@ async function requestArticle(
   const finishReason: string | undefined = choice?.finish_reason;
   const usage = payload?.usage;
 
-  // A truncated response is a budget problem, not a bad article, and saying so
-  // is the difference between a one-line fix and a long hunt. Reasoning models
-  // hit this by thinking until the token budget is gone.
-  if (finishReason === "length" && (typeof raw !== "string" || raw.trim() === "")) {
-    const reasoningTokens =
-      usage?.completion_tokens_details?.reasoning_tokens ?? "unknown";
+  const reasoningTokens =
+    usage?.completion_tokens_details?.reasoning_tokens ?? "unknown";
+  const contentLength = typeof raw === "string" ? raw.length : 0;
 
+  // A response that ran out of completion budget is a budget problem, not a
+  // bad article, and the two need different fixes. It is reported as truncated
+  // whether the content came back empty (the whole budget went on reasoning)
+  // or partial (cut off mid-JSON): previously only the empty case was
+  // recognised, so a half-written article was misreported as
+  // `invalid_article_structure` and sent back to the model as though its
+  // writing were at fault.
+  //
+  // Hitting the ceiling exactly on the closing brace is possible, so a
+  // complete, valid article is still accepted below before this is concluded.
+  const truncated = (): ProviderResult => {
     console.error(
       `provider_output_truncated: finish_reason=length, completion_tokens=${
         usage?.completion_tokens ?? "unknown"
-      }, reasoning_tokens=${reasoningTokens}, max_tokens=${AI_MAX_TOKENS}`,
+      }, reasoning_tokens=${reasoningTokens}, content_length=${contentLength}, ` +
+        `max_tokens=${AI_MAX_TOKENS}`,
     );
 
     return {
       ok: false,
       kind: "transient",
       code: "provider_output_truncated",
-      message: `finish_reason=length reasoning_tokens=${reasoningTokens} max_tokens=${AI_MAX_TOKENS}`,
+      message:
+        `finish_reason=length reasoning_tokens=${reasoningTokens} ` +
+        `content_length=${contentLength} max_tokens=${AI_MAX_TOKENS}`,
     };
+  };
+
+  if (finishReason === "length" && (typeof raw !== "string" || raw.trim() === "")) {
+    return truncated();
   }
 
   try {
@@ -312,8 +385,19 @@ async function requestArticle(
       );
     }
 
-    return { ok: true, article: ArticleSchema.parse(JSON.parse(raw)) };
+    return {
+      ok: true,
+      article: ArticleSchema.parse(normaliseArticlePayload(JSON.parse(raw))),
+    };
   } catch (error) {
+    // Ran out of budget mid-article: a truncation, not a malformed article.
+    // Never repaired by appending the missing brackets -- the article behind a
+    // cut-off string is incomplete, and completing its syntax would only make
+    // partial content look finished.
+    if (finishReason === "length") {
+      return truncated();
+    }
+
     const details =
       error instanceof z.ZodError
         ? error.issues.map((issue) => ({
@@ -325,7 +409,7 @@ async function requestArticle(
     console.error(
       `article validation failed (finish_reason=${finishReason ?? "unknown"}, completion_tokens=${
         usage?.completion_tokens ?? "unknown"
-      }, content_length=${typeof raw === "string" ? raw.length : "n/a"}):`,
+      }, content_length=${contentLength}):`,
       details ?? error,
     );
 
@@ -727,6 +811,25 @@ export async function runGenerationJob(
   const carriedRevisions = (existingPost?.revision_count as number | undefined) ?? 0;
   const carriedProviderRetries =
     (existingPost?.provider_retry_count as number | undefined) ?? 0;
+
+  // The scheduler's own label says whether the *job* was resumed, which is not
+  // the same as whether a *draft* was. A resumed job with no stored draft
+  // legitimately generates a first article, and without this line the run
+  // reads as `mode=resume_revision` with every attempt `kind=initial` and
+  // looks like a control-flow bug.
+  const draftState = existingPost?.best_draft
+    ? resumeFrom
+      ? "resumed"
+      : "stored_draft_invalid"
+    : "no_stored_draft";
+
+  console.log(
+    `[cycle] job=${jobId} location=${loc.slug as string} model=${model} ` +
+      `draft=${draftState} carriedRevisions=${carriedRevisions} ` +
+      `carriedProviderRetries=${carriedProviderRetries} budgetMs=${
+        input.budgetMs ?? QUALITY_CYCLE_BUDGET_MS
+      } schemaMode=${schemaModeSupported ? "json_schema" : "json_object"}`,
+  );
 
   // --- Generate, evaluate, improve, re-evaluate ---------------------------
 
