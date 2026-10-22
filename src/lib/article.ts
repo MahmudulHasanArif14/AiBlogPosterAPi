@@ -12,9 +12,7 @@ const ClaimInput = z
       sourceUrl: z.string().trim().url().max(500).optional(),
     }),
   ])
-  .transform((value) =>
-    typeof value === "string" ? { text: value } : value,
-  );
+  .transform((value) => (typeof value === "string" ? { text: value } : value));
 
 export const ArticleSchema = z.object({
   title: z.string().trim().min(25).max(100),
@@ -24,9 +22,9 @@ export const ArticleSchema = z.object({
     .min(3)
     .max(120)
     .regex(/^[a-z0-9]+(?:-[a-z0-9]+)*$/),
-  excerpt: z.string().trim().min(60).max(240),
-  content: z.string().trim().min(1200).max(14000),
-  metaDescription: z.string().trim().min(100).max(160),
+  excerpt: z.string().trim().min(30).max(240),
+  content: z.string().trim().min(800).max(14000),
+  metaDescription: z.string().trim().min(70).max(160),
   claims: z.array(ClaimInput).max(20).default([]),
   category: z.string().trim().min(3).max(60).optional(),
   tags: z.array(z.string().trim().min(2).max(40)).max(8).default([]),
@@ -143,18 +141,18 @@ export const ARTICLE_JSON_SCHEMA = {
         minLength: 3,
         maxLength: 120,
       },
-      excerpt: { type: "string", minLength: 60, maxLength: 240 },
-      content: { type: "string", minLength: 1200, maxLength: 14000 },
+      excerpt: { type: "string", minLength: 30, maxLength: 240 },
+      content: { type: "string", minLength: 800, maxLength: 14000 },
       // 155 rather than 160: the hard limit is 160, and leaving the model a
       // margin is what keeps a good article from failing on its meta tag.
-      metaDescription: { type: "string", minLength: 100, maxLength: 155 },
+      metaDescription: { type: "string", minLength: 70, maxLength: 155 },
       claims: {
         type: "array",
         maxItems: 20,
         items: {
           type: "object",
           additionalProperties: false,
-          required: ["text", "sourceUrl"],
+          required: ["text"],
           properties: {
             text: { type: "string", minLength: 5, maxLength: 500 },
             sourceUrl: { type: "string", maxLength: 500 },

@@ -271,13 +271,15 @@ export function checkQuality(
     warnings.push("content_longer_than_target");
   }
 
-  const paragraphs = article.content
-    .split(/\n{2,}/)
+  const normalizedContent = article.content.replace(/\r\n?/g, "\n").trim();
+
+  const paragraphs = normalizedContent
+    .split(/\n\s*\n/)
     .map((part) => part.trim())
     .filter(Boolean);
 
-  if (paragraphs.length < 4) {
-    reasons.push("missing_paragraph_structure");
+  if (paragraphs.length < 2) {
+    warnings.push("limited_paragraph_structure");
   }
 
   if (/<\/?[a-z][\s\S]*>/i.test(article.content)) {
