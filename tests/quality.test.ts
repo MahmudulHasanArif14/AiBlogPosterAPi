@@ -1,6 +1,11 @@
 import assert from "node:assert/strict";
 import { test, describe } from "node:test";
-import { ArticleSchema, normalizeTitle, readingMinutes } from "../src/lib/article";
+import {
+  ArticleSchema,
+  normalizeTitle,
+  normaliseArticlePayload,
+  readingMinutes,
+} from "../src/lib/article";
 import { findPlaceMentions } from "../src/lib/places";
 import { checkQuality, contentSimilarity, type QualityContext } from "../src/lib/quality";
 import { isTrustedCitation } from "../src/lib/sources";
@@ -435,5 +440,55 @@ describe("readingMinutes", () => {
 
   test("rounds up at 220 words per minute", () => {
     assert.equal(readingMinutes("word ".repeat(221)), 2);
+  });
+});
+
+describe("normaliseArticlePayload", () => {
+  const metaOf = (payload: unknown) =>
+    (payload as { metaDescription: string }).metaDescription;
+
+  test("leaves a meta description within the limit untouched", () => {
+    const meta = "a".repeat(160);
+    const result = normaliseArticlePayload({ metaDescription: meta });
+
+    assert.equal(metaOf(result), meta);
+  });
+
+  test("trims an overrunning meta description at a word boundary", () => {
+    const meta = `${"word ".repeat(40)}overflowing tail`;
+    const result = normaliseArticlePayload({ metaDescription: meta });
+    const trimmed = metaOf(result);
+
+    assert.ok(trimmed.length <= 160);
+    assert.ok(trimmed.length >= 100);
+    assert.ok(!trimmed.endsWith(" "));
+    assert.ok(meta.startsWith(trimmed));
+  });
+
+  test("a trimmed meta description still satisfies the schema", () => {
+    const article = {
+      title: "Getting to Gatwick Airport from East Grinstead by car",
+      slug: "gatwick-from-east-grinstead",
+      excerpt:
+        "What the drive from East Grinstead to Gatwick Airport actually involves, from route choice to where you can drop passengers off.",
+      content: "c".repeat(1300),
+      metaDescription: `${"The drive from East Grinstead to Gatwick takes about half an hour. ".repeat(3)}and here is some more text that pushes it over the limit.`,
+      claims: [],
+      tags: [],
+      sources: [],
+    };
+
+    const parsed = ArticleSchema.parse(normaliseArticlePayload(article));
+
+    assert.ok(parsed.metaDescription.length <= 160);
+    assert.ok(parsed.metaDescription.length >= 100);
+  });
+
+  test("passes through values it cannot normalise", () => {
+    assert.equal(normaliseArticlePayload(null), null);
+    assert.equal(normaliseArticlePayload("not an object"), "not an object");
+    assert.deepEqual(normaliseArticlePayload({ metaDescription: 7 }), {
+      metaDescription: 7,
+    });
   });
 });

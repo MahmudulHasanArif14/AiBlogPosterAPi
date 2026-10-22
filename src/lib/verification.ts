@@ -10,7 +10,12 @@ import type { ApprovedSource } from "./quality";
 // name for what this produces is traceability, which is why the result is
 // stored as verification_status rather than anything implying factual proof.
 
-export type SourceOutcome = "ok" | "restricted" | "missing" | "unreachable" | "not_approved";
+export type SourceOutcome =
+  | "ok"
+  | "restricted"
+  | "missing"
+  | "unreachable"
+  | "not_approved";
 
 export type SourceCheck = {
   url: string;
@@ -35,9 +40,7 @@ const USER_AGENT =
 
 function matchApproved(url: string, approved: ApprovedSource[]) {
   return (
-    approved.find(
-      (source) => source.sourceUrl && url === source.sourceUrl,
-    ) ??
+    approved.find((source) => source.sourceUrl && url === source.sourceUrl) ??
     approved.find(
       (source) => source.sourceUrl && url.startsWith(source.sourceUrl),
     ) ??
@@ -78,7 +81,9 @@ function classify(status: number): SourceOutcome {
   return "unreachable";
 }
 
-async function probe(url: string): Promise<{ status: number | null; outcome: SourceOutcome }> {
+async function probe(
+  url: string,
+): Promise<{ status: number | null; outcome: SourceOutcome }> {
   const headers = { "User-Agent": USER_AGENT, Accept: "*/*" };
 
   for (const method of ["HEAD", "GET"] as const) {
@@ -91,7 +96,10 @@ async function probe(url: string): Promise<{ status: number | null; outcome: Sou
       });
 
       // Some servers answer HEAD with 405 but serve GET normally.
-      if (method === "HEAD" && (response.status === 405 || response.status === 501)) {
+      if (
+        method === "HEAD" &&
+        (response.status === 405 || response.status === 501)
+      ) {
         continue;
       }
 
@@ -110,10 +118,9 @@ export async function verifySources(
   declaredUrls: string[],
   approved: ApprovedSource[],
 ): Promise<VerificationResult> {
-  const unique = [...new Set(declaredUrls.map((url) => url.trim()).filter(Boolean))].slice(
-    0,
-    MAX_SOURCES_CHECKED,
-  );
+  const unique = [
+    ...new Set(declaredUrls.map((url) => url.trim()).filter(Boolean)),
+  ].slice(0, MAX_SOURCES_CHECKED);
 
   if (unique.length === 0) {
     return {

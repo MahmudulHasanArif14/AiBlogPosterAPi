@@ -11,7 +11,15 @@
 export type CuratedSource = {
   sourceName: string;
   sourceUrl: string;
-  sourceType: "airport" | "rail" | "road" | "licensing" | "council" | "weather" | "education" | "tourism";
+  sourceType:
+    | "airport"
+    | "rail"
+    | "road"
+    | "licensing"
+    | "council"
+    | "weather"
+    | "education"
+    | "tourism";
   notes: string;
 };
 
@@ -67,7 +75,8 @@ export const CURATED_SOURCES: CuratedSource[] = [
   },
   {
     sourceName: "GOV.UK taxi and private hire vehicle licensing",
-    sourceUrl: "https://www.gov.uk/transport/taxi-and-private-hire-vehicle-licensing",
+    sourceUrl:
+      "https://www.gov.uk/transport/taxi-and-private-hire-vehicle-licensing",
     sourceType: "licensing",
     notes:
       "Authoritative for the legal distinction between hackney carriages and private hire vehicles, and for the requirement that private hire journeys be pre-booked through a licensed operator.",
@@ -206,6 +215,7 @@ export function trustedHostnames(): Set<string> {
       hosts.add(new URL(source.sourceUrl).hostname.toLowerCase());
     } catch {
       // A malformed curated URL is a code bug, not a runtime condition.
+      console.error(`Curated source has malformed URL: ${source.sourceUrl}`);
     }
   }
 

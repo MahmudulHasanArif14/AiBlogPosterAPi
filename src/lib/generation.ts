@@ -1,11 +1,19 @@
 import { createHash } from "node:crypto";
 import { z } from "zod";
-import { ArticleSchema, readingMinutes, type Article } from "./article";
 import {
+  ARTICLE_JSON_SCHEMA,
+  ArticleSchema,
+  normaliseArticlePayload,
+  readingMinutes,
+  type Article,
+} from "./article";
+import {
+  AI_MAX_TOKENS,
   AI_REQUEST_TIMEOUT_MS,
   MAX_ARTICLE_REVISION_AGE_HOURS,
   MIN_ARTICLE_QUALITY_SCORE,
   POSTS_CACHE_TAG,
+  QUALITY_CYCLE_BUDGET_MS,
   siteUrl,
 } from "./config";
 import { enqueueDelivery } from "./delivery";
@@ -23,30 +31,7 @@ import {
 } from "./revision";
 import { supabaseAdmin } from "./supabase";
 import { verifySources } from "./verification";
-
-// The whole generation pipeline, callable from both the manual endpoint and the
-// scheduled cron. It is deliberately a plain function rather than an internal
-// HTTP call: this project runs on Vercel's Hobby plan, where a function is
-// killed at 60 seconds, so a cron that waited on a second function's full
-// request budget could never finish.
-//
-// A draft that fails the quality gate is not abandoned. It goes back to the
-// provider with the exact checks it failed and is re-evaluated by the same
-// evaluator, repeatedly, until it passes or a bound is reached. The bounds and
-// the resume semantics live in ./revision; this module supplies the provider,
-// the evaluator and the persistence.
-
-// The configured model is a reasoning model: it spends completion tokens
-// thinking before it writes anything. At 4500 the entire budget went to
-// reasoning and the response came back with finish_reason 'length' and an empty
-// content string, which is what made every article fail validation. The budget
-// has to cover reasoning *and* a 650-1000 word article.
-//
-// Measured: ~6000 reasoning + ~1300 content tokens, 60-115 seconds end to end.
-// `reasoning: { effort: "low" }` made it *slower* (113s vs 58s unset), and
-// `reasoning: { exclude: true }` only hides reasoning from the response without
-// saving the tokens. Neither is used.
-const AI_MAX_TOKENS = 10_000;
+import { LOCATION_TOPICS, SHARED_TOPIC_ANGLES } from "@/lib/topics";
 
 export type GenerationOutcome = {
   httpStatus: number;
@@ -57,27 +42,31 @@ export type GenerationInput = {
   jobId: string;
   locationSlug: string;
   topic: string;
-  /**
-   * How long this cycle may spend revising. The scheduled worker leaves it
-   * unset and uses the configured default; the Vercel routes pass something
-   * well inside their own 60-second ceiling.
-   */
   budgetMs?: number;
 };
 
 const POST_RETURN_COLUMNS =
   "id,title,slug,status,published_at,canonical_url,image_url,image_source_url,image_license";
 
-/**
- * Everything a resumed cycle needs about the draft an earlier cycle left,
- * plus the columns the API returns. One select, no duplicated column names.
- */
 const RESUME_SELECT =
   "id,title,slug,status,published_at,canonical_url,image_url,image_source_url,image_license,created_at,revision_count,provider_retry_count,best_quality_score,best_draft";
 
 function contentHash(value: string) {
   const normalised = value.toLowerCase().replace(/\s+/g, " ").trim();
   return createHash("sha256").update(normalised).digest("hex");
+}
+
+// TOPIC ANGLES: deterministically select an angle for a generation job.
+// Retries and revisions for the same job retain the same selected angles.
+function stablePick<T>(items: readonly T[], seed: string): T {
+  if (items.length === 0) {
+    throw new Error("Cannot select an angle from an empty list");
+  }
+
+  const hash = createHash("sha256").update(seed).digest();
+  const index = hash.readUInt32BE(0) % items.length;
+
+  return items[index]!;
 }
 
 function buildSystemPrompt() {
@@ -89,8 +78,9 @@ function buildSystemPrompt() {
     "",
     "Hard rules:",
     "- content is plain text. No HTML, no markdown headings, no bullet characters.",
-    "- content has at least four paragraphs separated by one blank line.",
-    "- content is between 600 and 1200 words.",
+    "- Use clear paragraphs separated by blank lines. Aim for 4–6 paragraphs,",
+    "  each covering a distinct part of the reader's problem.",
+    "- content is between 600 and 1200 words. Avoid padding.",
     "- Never put a URL inside content. Cite sources only in the sources array.",
     "- sources must contain only URLs copied exactly from the approvedSources list you are given.",
     "- claims is an array of objects: { text, sourceUrl }. Declare EVERY statement in",
@@ -105,7 +95,9 @@ function buildSystemPrompt() {
     "  testimonials, reviews, awards or legal claims.",
     "- Never make a superlative or guarantee claim about any operator: no cheapest,",
     "  best, fastest, award-winning, guaranteed fare, always on time, 100% reliable.",
-    "- metaDescription is between 100 and 160 characters.",
+    "- metaDescription must be between 100 and 160 characters. Aim for 140-155",
+    "  characters: 160 is a hard limit and overrunning it fails the article.",
+    "  Count the characters before returning it.",
     "- title is between 25 and 100 characters and must not repeat or closely",
     "  paraphrase any title in recentArticleTitles.",
     "- slug is lowercase, hyphen-separated, derived from the title.",
@@ -118,9 +110,13 @@ function buildSystemPrompt() {
   ].join("\n");
 }
 
+// TOPIC ANGLES: include both selected angles in the shared context so the
+// initial generation and every revision receive the same instructions.
 type PromptContext = {
   locationName: string;
   topic: string;
+  topicAngle: string;
+  sharedAngle: string;
   recentArticleTitles: string[];
   approvedSources: ApprovedSource[];
 };
@@ -133,30 +129,32 @@ function serialiseSources(approvedSources: ApprovedSource[]) {
   }));
 }
 
+// TOPIC ANGLES: the location-specific angle is the primary subject.
+// The shared angle is supplementary, not a competing topic.
 function buildUserPrompt(input: PromptContext) {
   return JSON.stringify({
     location: input.locationName,
     topicInstructions: input.topic,
+    selectedLocationAngle: input.topicAngle,
+    selectedSharedAngle: input.sharedAngle,
     recentArticleTitles: input.recentArticleTitles,
     approvedSources: serialiseSources(input.approvedSources),
     requirements:
-      "Choose the specific subject and angle yourself, using the location and " +
-      "topic instructions as context rather than as a fixed title. Pick one " +
-      "concrete reader question and answer it properly. Avoid repeating the " +
-      "angle of any recent article title listed above. Return only the JSON " +
+      "Use selectedLocationAngle as the main subject and selectedSharedAngle " +
+      "as a supporting approach where relevant. The location-specific angle " +
+      "takes priority. Answer one concrete reader question with useful, " +
+      "original information. Do not force the shared angle if it does not fit. " +
+      "Avoid repeating recent article titles or their underlying subjects. " +
+      "Use only facts supported by the approved sources. Return only the JSON " +
       "object described in the system message.",
   });
 }
 
 /**
- * The correction prompt. It carries the previous draft, the checks it actually
- * failed and the evidence behind them, so a revision can fix the named
- * weaknesses rather than re-rolling the article.
+ * The correction prompt carries the previous draft, failed checks and evidence
+ * so revisions fix named weaknesses instead of re-rolling the article.
  *
- * It never asks the model to invent a fact, fabricate a source, adjust a score
- * or declare a failed check passed: an unsupportable claim has to leave the
- * article. The evaluator rescores the result; nothing the model says about its
- * own quality is read.
+ * It preserves the original slug and both selected topic angles.
  */
 export function buildRevisionPrompt(
   request: RevisionRequest,
@@ -192,11 +190,14 @@ export function buildRevisionPrompt(
     mustNotChange: {
       location: context.locationName,
       topicInstructions: context.topic,
+      selectedLocationAngle: context.topicAngle,
+      selectedSharedAngle: context.sharedAngle,
       slug: context.preserveSlug,
       note:
-        "Keep the same target location, the same business identity, and the " +
-        "same slug. The slug is part of a URL that may already be recorded, " +
-        "so return it unchanged even if you change the title.",
+        "Keep the same target location, the same business identity, the same " +
+        "selected topic angles, and the same slug. The slug is part of a URL " +
+        "that may already be recorded, so return it unchanged even if you " +
+        "change the title.",
     },
     approvedSources: serialiseSources(context.approvedSources),
     recentArticleTitles: context.recentArticleTitles,
@@ -205,26 +206,31 @@ export function buildRevisionPrompt(
       "A claim you cannot trace to an approved source must be removed from the article, not softened.",
       "Do not claim a check passes. The checks are re-run by a separate evaluator.",
       "Keep everything the previous draft got right; change what the failed checks name.",
+      "Keep the same selected location and shared topic angles throughout revisions.",
+      "Use the selected location angle as the main subject and the shared angle only where relevant.",
     ],
   });
 }
 
 // --- Provider adapter ------------------------------------------------------
 
-/**
- * One provider call, classified for the retry policy.
- *
- * `permanent` covers the errors retrying cannot fix — bad credentials, a
- * rejected request, a model that does not exist. Everything else (rate limits,
- * 5xx, timeouts, truncated or unparseable output) is transient and gets a
- * bounded, jittered retry.
- */
-async function requestArticle(
+let schemaModeSupported = true;
+
+function rejectsResponseFormat(body: string) {
+  return /response_format|json[_ ]schema|structured[_ ]outputs?/i.test(body);
+}
+
+export function resetSchemaModeForTests() {
+  schemaModeSupported = true;
+}
+
+export async function requestArticle(
   userPrompt: string,
   model: string,
   key: string,
 ): Promise<ProviderResult> {
   let response: Response;
+  const useSchema = schemaModeSupported;
 
   try {
     response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
@@ -239,7 +245,9 @@ async function requestArticle(
         model,
         temperature: 0.3,
         max_tokens: AI_MAX_TOKENS,
-        response_format: { type: "json_object" },
+        response_format: useSchema
+          ? { type: "json_schema", json_schema: ARTICLE_JSON_SCHEMA }
+          : { type: "json_object" },
         messages: [
           { role: "system", content: buildSystemPrompt() },
           { role: "user", content: userPrompt },
@@ -262,13 +270,26 @@ async function requestArticle(
       };
     }
 
-    // 408 and 409 are worth another go; the rest of the 4xx range is the
-    // request itself being wrong, which a retry cannot change.
     const permanent =
       response.status >= 400 &&
       response.status < 500 &&
       response.status !== 408 &&
       response.status !== 409;
+
+    if (permanent && useSchema) {
+      const body = await response.text().catch(() => "");
+
+      if (rejectsResponseFormat(body)) {
+        schemaModeSupported = false;
+
+        console.warn(
+          `provider rejected json_schema response format (HTTP ${response.status}); ` +
+            "falling back to json_object for the rest of this process",
+        );
+
+        return requestArticle(userPrompt, model, key);
+      }
+    }
 
     return {
       ok: false,
@@ -284,25 +305,33 @@ async function requestArticle(
   const finishReason: string | undefined = choice?.finish_reason;
   const usage = payload?.usage;
 
-  // A truncated response is a budget problem, not a bad article, and saying so
-  // is the difference between a one-line fix and a long hunt. Reasoning models
-  // hit this by thinking until the token budget is gone.
-  if (finishReason === "length" && (typeof raw !== "string" || raw.trim() === "")) {
-    const reasoningTokens =
-      usage?.completion_tokens_details?.reasoning_tokens ?? "unknown";
+  const reasoningTokens =
+    usage?.completion_tokens_details?.reasoning_tokens ?? "unknown";
+  const contentLength = typeof raw === "string" ? raw.length : 0;
 
+  const truncated = (): ProviderResult => {
     console.error(
       `provider_output_truncated: finish_reason=length, completion_tokens=${
         usage?.completion_tokens ?? "unknown"
-      }, reasoning_tokens=${reasoningTokens}, max_tokens=${AI_MAX_TOKENS}`,
+      }, reasoning_tokens=${reasoningTokens}, content_length=${contentLength}, ` +
+        `max_tokens=${AI_MAX_TOKENS}`,
     );
 
     return {
       ok: false,
       kind: "transient",
       code: "provider_output_truncated",
-      message: `finish_reason=length reasoning_tokens=${reasoningTokens} max_tokens=${AI_MAX_TOKENS}`,
+      message:
+        `finish_reason=length reasoning_tokens=${reasoningTokens} ` +
+        `content_length=${contentLength} max_tokens=${AI_MAX_TOKENS}`,
     };
+  };
+
+  if (
+    finishReason === "length" &&
+    (typeof raw !== "string" || raw.trim() === "")
+  ) {
+    return truncated();
   }
 
   try {
@@ -312,8 +341,15 @@ async function requestArticle(
       );
     }
 
-    return { ok: true, article: ArticleSchema.parse(JSON.parse(raw)) };
+    return {
+      ok: true,
+      article: ArticleSchema.parse(normaliseArticlePayload(JSON.parse(raw))),
+    };
   } catch (error) {
+    if (finishReason === "length") {
+      return truncated();
+    }
+
     const details =
       error instanceof z.ZodError
         ? error.issues.map((issue) => ({
@@ -325,13 +361,10 @@ async function requestArticle(
     console.error(
       `article validation failed (finish_reason=${finishReason ?? "unknown"}, completion_tokens=${
         usage?.completion_tokens ?? "unknown"
-      }, content_length=${typeof raw === "string" ? raw.length : "n/a"}):`,
+      }, content_length=${contentLength}):`,
       details ?? error,
     );
 
-    // A malformed or schema-violating response is the model's output, not the
-    // request: another attempt is worth making, bounded by the provider retry
-    // budget rather than retried forever.
     return {
       ok: false,
       kind: "transient",
@@ -387,9 +420,42 @@ export async function runGenerationJob(
   if (locError || !loc || !loc.enabled) {
     return {
       httpStatus: 404,
-      body: { error: "Location not found or disabled", code: "unknown_location" },
+      body: {
+        error: "Location not found or disabled",
+        code: "unknown_location",
+      },
     };
   }
+
+  // TOPIC ANGLES: fail safely if this enabled location has no angle config.
+  // This check happens before claiming the job so a configuration error
+  // does not consume a generation attempt.
+  const locationTopicConfig = LOCATION_TOPICS.find(
+    (item) => item.location === loc.slug,
+  );
+
+  // Lengths are read as plain numbers so a const-typed empty array still
+  // trips this guard instead of being narrowed away at compile time.
+  const locationAngleCount: number = Array.isArray(
+    locationTopicConfig?.topicAngles,
+  )
+    ? locationTopicConfig.topicAngles.length
+    : 0;
+  const sharedAngleCount: number = SHARED_TOPIC_ANGLES.length;
+
+  if (!locationTopicConfig || locationAngleCount === 0 || sharedAngleCount === 0) {
+    console.error(`Missing topic configuration for location: ${loc.slug}`);
+
+    return {
+      httpStatus: 500,
+      body: {
+        error: "Location topic angles are not configured",
+        code: "topic_config_missing",
+      },
+    };
+  }
+
+  // --- Topic angles are available -----------------------------------------
 
   const { data: job, error: jobError } = await supabase
     .from("generation_jobs")
@@ -408,12 +474,6 @@ export async function runGenerationJob(
   }
 
   // --- One article per job, enforced by a unique index --------------------
-  //
-  // An existing article is not automatically the end of the job. A published
-  // one is: there is nothing left to do. A draft still in review is the work in
-  // progress of an earlier cycle, and this cycle resumes *that* draft rather
-  // than generating a new article — which is what stops a revision consuming
-  // another day's rotation turn.
 
   const { data: existingPost, error: existingError } = await supabase
     .from("posts")
@@ -445,10 +505,6 @@ export async function runGenerationJob(
     };
   }
 
-  // An operator's decision is final. `failed` is what /api/admin/review writes
-  // when someone rejects a draft, and `draft`/`queued` are states this pipeline
-  // never produces, so in both cases a human owns the row. Revising it would
-  // overwrite their decision and flip the article back into the review queue.
   if (existingPost && existingPost.status !== "needs_review") {
     await abandonJob(
       "article_not_resumable",
@@ -486,9 +542,6 @@ export async function runGenerationJob(
   }
 
   if (!claimed) {
-    // Another worker holds the lease, the retry window has not opened, or the
-    // attempts are spent. Either way this process must not revise the article:
-    // two concurrent revisions of one draft would overwrite each other.
     return {
       httpStatus: 409,
       body: {
@@ -502,15 +555,9 @@ export async function runGenerationJob(
     };
   }
 
-  // A draft that has been in revision for too long stops being retried: the
-  // loop cannot promise that a permanently failing article will ever pass, and
-  // an unbounded retry would hold this location's rotation turn indefinitely.
-  //
-  // This is checked only once the claim is held. Abandoning a job on the
-  // strength of a read alone could terminate one another worker is part-way
-  // through revising.
   if (existingPost) {
-    const ageMs = Date.now() - new Date(existingPost.created_at as string).getTime();
+    const ageMs =
+      Date.now() - new Date(existingPost.created_at as string).getTime();
     const maxAgeMs = MAX_ARTICLE_REVISION_AGE_HOURS * 3_600_000;
 
     if (ageMs > maxAgeMs) {
@@ -575,8 +622,6 @@ export async function runGenerationJob(
   );
 
   if (approvedSources.length === 0) {
-    // Without approved sources nothing can be traced, so nothing could ever be
-    // published. Fail loudly rather than generating unusable drafts.
     await failJob(
       "no_approved_sources",
       "content_sources has no approved rows; seed them before generating",
@@ -593,16 +638,16 @@ export async function runGenerationJob(
     };
   }
 
-  // The article being revised must not count as its own duplicate, so the row
-  // this job owns is excluded from the duplication corpus.
   const ownPostId = (existingPost?.id as string | undefined) ?? null;
 
   const existingTitles = (titlesResult.data ?? [])
     .filter((row) => row.id !== ownPostId)
     .map((row) => row.title as string);
+
   const existingSlugs = (titlesResult.data ?? [])
     .filter((row) => row.id !== ownPostId)
     .map((row) => row.slug as string);
+
   const existingContents = (contentsResult.data ?? [])
     .filter((row) => row.id !== ownPostId)
     .map((row) => ({
@@ -616,37 +661,45 @@ export async function runGenerationJob(
   const key = process.env.OPENROUTER_API_KEY;
 
   if (!model || !key) {
-    // Bounded by the job's own attempt budget rather than abandoned outright:
-    // the fix is an environment variable, and once it is set the next cycle
-    // should pick the job up instead of needing a manual requeue.
     await failJob("ai_provider_not_configured");
 
     return {
       httpStatus: 503,
-      body: { error: "AI provider not configured", code: "provider_not_configured" },
+      body: {
+        error: "AI provider not configured",
+        code: "provider_not_configured",
+      },
     };
   }
+
+  // TOPIC ANGLES: choose the angles once per job. All revisions receive the
+  // same PromptContext, preventing the article from drifting to a new subject.
+  const topicAngle = stablePick(
+    locationTopicConfig.topicAngles,
+    `${jobId}:${loc.slug}:location-angle`,
+  );
+
+  const sharedAngle = stablePick(
+    SHARED_TOPIC_ANGLES,
+    `${jobId}:${loc.slug}:shared-angle`,
+  );
 
   const promptContext: PromptContext = {
     locationName: loc.name as string,
     topic: input.topic,
+    topicAngle,
+    sharedAngle,
     recentArticleTitles: existingTitles.slice(0, 40),
     approvedSources,
   };
 
-  // --- The evaluator ------------------------------------------------------
-  //
-  // The single source of truth for pass and fail, used identically on the first
-  // draft and on every revision. The score it returns is the one that is
-  // stored; the model's opinion of its own article is never read.
-  //
-  // The provenance check and the image lookup are network-bound and independent
-  // of each other, so they run together: sequentially they were the two slowest
-  // steps after generation.
+  console.log(
+    `[topics] job=${jobId} location=${loc.slug} ` +
+      `topicAngle="${topicAngle}" sharedAngle="${sharedAngle}"`,
+  );
 
-  // The image each draft was evaluated with, so the row that is saved carries
-  // the licence that was actually checked against the draft being saved --
-  // not whatever the last revision happened to find.
+  // --- The evaluator ------------------------------------------------------
+
   const imageByDraft = new Map<Article, FeaturedImage | null>();
   let matchedImage: FeaturedImage | null = null;
 
@@ -668,14 +721,14 @@ export async function runGenerationJob(
 
     const [verification, image] = await Promise.all([
       verifySources(declaredSourceUrls, approvedSources),
-      // A licence once matched stays matched: re-fetching it on every revision
-      // would spend the cycle's budget re-answering a settled question.
       matchedImage
         ? Promise.resolve(matchedImage)
-        : findWikimediaImage(loc.name as string, article.title).catch((error) => {
-            console.error("image lookup failed:", error);
-            return null;
-          }),
+        : findWikimediaImage(loc.name as string, article.title).catch(
+            (error) => {
+              console.error("image lookup failed:", error);
+              return null;
+            },
+          ),
     ]);
 
     if (image) {
@@ -691,6 +744,9 @@ export async function runGenerationJob(
     }
 
     if (verification.status !== "verified") {
+      console.warn(
+        `Source verification failed for article: ${article.title}, status: ${verification.status}`,
+      );
       blocking.push(`verification_${verification.status}`);
     }
 
@@ -698,9 +754,9 @@ export async function runGenerationJob(
 
     return {
       score: quality.score,
-      // Both conditions, always: the score *and* every mandatory gate. A high
-      // score can never carry a failed provenance check.
-      pass: uniqueBlocking.length === 0 && quality.score >= MIN_ARTICLE_QUALITY_SCORE,
+      pass:
+        uniqueBlocking.length === 0 &&
+        quality.score >= MIN_ARTICLE_QUALITY_SCORE,
       blocking: uniqueBlocking,
       quality,
       verification,
@@ -708,7 +764,7 @@ export async function runGenerationJob(
     };
   };
 
-  // --- Resume an earlier cycle's draft, or start a new one -----------------
+  // --- Resume an earlier cycle's draft, or start a new one ----------------
 
   let resumeFrom: { article: Article } | null = null;
 
@@ -724,9 +780,25 @@ export async function runGenerationJob(
     }
   }
 
-  const carriedRevisions = (existingPost?.revision_count as number | undefined) ?? 0;
+  const carriedRevisions =
+    (existingPost?.revision_count as number | undefined) ?? 0;
+
   const carriedProviderRetries =
     (existingPost?.provider_retry_count as number | undefined) ?? 0;
+
+  const draftState = existingPost?.best_draft
+    ? resumeFrom
+      ? "resumed"
+      : "stored_draft_invalid"
+    : "no_stored_draft";
+
+  console.log(
+    `[cycle] job=${jobId} location=${loc.slug as string} model=${model} ` +
+      `draft=${draftState} carriedRevisions=${carriedRevisions} ` +
+      `carriedProviderRetries=${carriedProviderRetries} budgetMs=${
+        input.budgetMs ?? QUALITY_CYCLE_BUDGET_MS
+      } schemaMode=${schemaModeSupported ? "json_schema" : "json_object"}`,
+  );
 
   // --- Generate, evaluate, improve, re-evaluate ---------------------------
 
@@ -736,6 +808,7 @@ export async function runGenerationJob(
     {
       generateInitial: () =>
         requestArticle(buildUserPrompt(promptContext), model, key),
+
       reviseDraft: (request) =>
         requestArticle(
           buildRevisionPrompt(request, {
@@ -745,9 +818,9 @@ export async function runGenerationJob(
           model,
           key,
         ),
+
       evaluate,
-      // A full cycle can outlast the five-minute processing lease, which would
-      // let a second worker take the job mid-revision.
+
       heartbeat: async () => {
         const { error } = await supabase
           .from("generation_jobs")
@@ -759,6 +832,7 @@ export async function runGenerationJob(
           console.error("lease heartbeat failed:", error.message);
         }
       },
+
       log: (entry) => {
         attemptLog.push(entry);
 
@@ -774,8 +848,6 @@ export async function runGenerationJob(
     },
     {
       budgetMs: input.budgetMs,
-      // A call that cannot finish inside what is left of the cycle is not
-      // started: the next cycle resumes the draft instead.
       minCallBudgetMs: AI_REQUEST_TIMEOUT_MS,
       resumeFrom,
     },
@@ -841,8 +913,6 @@ export async function runGenerationJob(
       .filter((url): url is string => typeof url === "string"),
   ];
 
-  // The latest revision is only worth keeping separately when it was not the
-  // draft we are storing: that is the diagnosis case.
   const latestDraft =
     loop.latest && loop.latest.article !== article
       ? {
@@ -861,8 +931,6 @@ export async function runGenerationJob(
     content: article.content,
     meta_description: article.metaDescription,
 
-    // Reaching the retry limit is never a reason to publish. Only the
-    // evaluator's verdict can move an article out of review.
     status: publish ? "published" : "needs_review",
     published_at: publish ? now : null,
     canonical_url: publish ? `${base}/posts/${article.slug}` : null,
@@ -873,8 +941,6 @@ export async function runGenerationJob(
     reading_minutes: readingMinutes(article.content),
     content_hash: contentHash(article.content),
 
-    // The score the database trigger checks must reflect everything blocking,
-    // not just the text-level gate, or a missing image could slip through.
     quality_score:
       evaluation.blocking.length === 0
         ? evaluation.score
@@ -941,14 +1007,16 @@ export async function runGenerationJob(
   if (saveError || !post) {
     console.error("article save failed:", saveError?.message);
 
-    // A previous attempt may have saved the article before failing to report.
     const { data: recovered } = await supabase
       .from("posts")
       .select(POST_RETURN_COLUMNS)
       .eq("job_id", jobId)
       .maybeSingle();
 
-    if (recovered && (recovered as { status?: string }).status === "published") {
+    if (
+      recovered &&
+      (recovered as { status?: string }).status === "published"
+    ) {
       await supabase.rpc("complete_generation_job", {
         p_job_id: jobId,
         p_note: "recovered_existing_article",
@@ -960,7 +1028,6 @@ export async function runGenerationJob(
       };
     }
 
-    // 23505 is a unique violation: a duplicate title or an identical body.
     const duplicate = saveError?.code === "23505";
 
     await failJob(
@@ -981,11 +1048,6 @@ export async function runGenerationJob(
   }
 
   // --- Job state ----------------------------------------------------------
-  //
-  // Only a passing article completes the job. A draft that is still below the
-  // bar goes back to the retry queue with the job's own backoff, so the next
-  // cycle resumes it; once the job's attempt budget is spent fail_generation_job
-  // makes it 'exhausted' and the draft stays in review for a person to pick up.
 
   let jobState: Record<string, unknown> | null = null;
 
@@ -1006,10 +1068,6 @@ export async function runGenerationJob(
     );
   }
 
-  // Clear the cached listings so a newly published article is visible on the
-  // next request rather than after the revalidate window. Outside a Next
-  // request context -- the scheduled worker -- this is a no-op, and the worker
-  // calls /api/admin/revalidate instead.
   let delivery: { ok: boolean; deliveryId?: string; error?: string } | null =
     null;
 
@@ -1018,16 +1076,9 @@ export async function runGenerationJob(
       const { revalidateTag } = await import("next/cache");
       revalidateTag(POSTS_CACHE_TAG);
     } catch {
-      // Not running inside Next. Expected for the scheduled worker.
+      // Expected when running outside a Next.js request context.
     }
 
-    // Record that the location's website is owed a notification. This writes a
-    // queue row and nothing more: no HTTP request is made on the generation
-    // path, because generation already takes 60-115 seconds and must not also
-    // wait on someone else's website.
-    //
-    // enqueueDelivery never throws. If this fails, the article is still
-    // published and the scheduled reconciler picks it up within one interval.
     delivery = await enqueueDelivery(supabase, post.id as string, "published");
   }
 
@@ -1043,6 +1094,8 @@ export async function runGenerationJob(
       model,
       job_id: jobId,
       location: loc.slug,
+      topic_angle: topicAngle,
+      shared_angle: sharedAngle,
       quality_score: postData.quality_score,
       quality_reasons: evaluation.blocking,
       quality_warnings: evaluation.quality.warnings,
@@ -1072,14 +1125,10 @@ export async function runGenerationJob(
   }
 
   return {
-    // A draft that will be revised again is not an error and not a success:
-    // 202 says the work is accepted and still in progress.
     httpStatus: passed ? (existingPost ? 200 : 201) : 202,
     body: {
       post,
       published: publish,
-      // Surfaced so the worker's log says whether distribution was queued, not
-      // just whether the article published.
       delivery,
       loop: {
         outcome: loop.outcome,

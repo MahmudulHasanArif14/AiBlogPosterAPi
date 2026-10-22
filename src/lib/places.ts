@@ -13,6 +13,9 @@ export const KNOWN_AIRPORTS = [
   "london gatwick",
   "gatwick north terminal",
   "gatwick south terminal",
+  // Terminal names as prose writes them, for airports that have them.
+  "north terminal",
+  "south terminal",
   "heathrow",
   "london heathrow",
   "london city",
@@ -183,6 +186,14 @@ const LEADING_NOISE = new Set([
   "mainline",
 ]);
 
+// Direction words that stand in for a terminal of an airport named elsewhere.
+const BARE_TERMINAL_QUALIFIERS = new Set([
+  "north",
+  "south",
+  "east",
+  "west",
+]);
+
 export type PlaceMention = {
   name: string;
   kind: "airport" | "station" | "port";
@@ -215,6 +226,13 @@ export function findPlaceMentions(text: string): PlaceMention[] {
     const name = stripNoise(match[1]);
 
     if (!name || LEADING_NOISE.has(name)) {
+      continue;
+    }
+
+    // "the North Terminal" names a part of an airport already established by
+    // the surrounding text, not an airport of its own, so there is nothing
+    // here to recognise or to invent.
+    if (noun === "terminal" && BARE_TERMINAL_QUALIFIERS.has(name)) {
       continue;
     }
 

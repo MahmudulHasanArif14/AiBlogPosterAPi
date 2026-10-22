@@ -8,7 +8,7 @@
     "start": "next start",
     "lint": "eslint .",
     "type-check": "tsc --noEmit",
-    "test": "node --import tsx --test tests/quality.test.ts tests/delivery.test.ts tests/revision.test.ts",
+    "test": "node --import tsx --test tests/quality.test.ts tests/delivery.test.ts tests/revision.test.ts tests/generation.test.ts tests/config.test.ts",
     "verify": "npm run lint && npm run type-check && npm test",
     "generate:daily": "tsx scripts/generate.ts --daily",
     "generate:one": "tsx scripts/generate.ts"

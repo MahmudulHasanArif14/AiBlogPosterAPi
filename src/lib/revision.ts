@@ -149,7 +149,7 @@ const CHECK_INSTRUCTIONS: Record<string, string> = {
   html_in_content:
     "Remove every HTML tag from content. It must be plain text with no markup.",
   meta_description_length:
-    "Rewrite metaDescription so it is between 100 and 160 characters, reads as a real summary, and matches the article's search intent.",
+    "Rewrite metaDescription so it is between 100 and 160 characters -- aim for 140-155, because 160 is a hard limit -- reads as a real summary, and matches the article's search intent.",
   excerpt_duplicates_title:
     "Rewrite excerpt so it adds information instead of restating the title: say what the reader will be able to decide after reading.",
   duplicate_title:
@@ -268,11 +268,25 @@ export function isBetterDraft(
  */
 export function backoffDelayMs(
   attempt: number,
-  options: { retryAfterMs?: number; random?: () => number; baseMs?: number; capMs?: number } = {},
+  options: {
+    retryAfterMs?: number;
+    random?: () => number;
+    baseMs?: number;
+    capMs?: number;
+  } = {},
 ): number {
-  const { retryAfterMs, random = Math.random, baseMs = 2_000, capMs = 60_000 } = options;
+  const {
+    retryAfterMs,
+    random = Math.random,
+    baseMs = 2_000,
+    capMs = 60_000,
+  } = options;
 
-  if (typeof retryAfterMs === "number" && Number.isFinite(retryAfterMs) && retryAfterMs > 0) {
+  if (
+    typeof retryAfterMs === "number" &&
+    Number.isFinite(retryAfterMs) &&
+    retryAfterMs > 0
+  ) {
     return Math.min(retryAfterMs, capMs);
   }
 
@@ -317,8 +331,15 @@ const defaultSleep = (ms: number) =>
  * them and this enforces it, so a revision cannot quietly move the article to a
  * different place or break a canonical URL that is already published.
  */
-export function preserveInvariants(revised: Article, original: Article): Article {
-  return { ...revised, slug: original.slug };
+export function preserveInvariants(
+  revised: Article,
+  original: Article,
+  preserveSlug = true,
+): Article {
+  return {
+    ...revised,
+    slug: preserveSlug ? original.slug : revised.slug,
+  };
 }
 
 export async function runImprovementLoop(
@@ -351,7 +372,11 @@ export async function runImprovementLoop(
   const budgetLeft = () => budgetMs - elapsed();
 
   const record = (entry: Omit<AttemptLog, "providerRetries" | "elapsedMs">) => {
-    const full: AttemptLog = { ...entry, providerRetries, elapsedMs: elapsed() };
+    const full: AttemptLog = {
+      ...entry,
+      providerRetries,
+      elapsedMs: elapsed(),
+    };
     attempts.push(full);
     deps.log?.(full);
   };
@@ -409,7 +434,10 @@ export async function runImprovementLoop(
 
       lastError = { code: result.code, message: result.message };
 
-      if (result.kind === "permanent" || providerRetries >= maxProviderRetries) {
+      if (
+        result.kind === "permanent" ||
+        providerRetries >= maxProviderRetries
+      ) {
         record({
           attempt: attempts.length + 1,
           kind,
