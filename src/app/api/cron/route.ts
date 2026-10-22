@@ -7,6 +7,12 @@ export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 export const maxDuration = 60;
 
+// A revision cycle cannot run inside a 60-second function: one provider call
+// alone costs 60-115 seconds. This route therefore produces or re-evaluates a
+// single draft and leaves any revision to the scheduled worker, which has no
+// such ceiling.
+const ROUTE_CYCLE_BUDGET_MS = 50_000;
+
 
 
 /**
@@ -92,6 +98,7 @@ export async function GET(req: NextRequest) {
       jobId: retryable.id,
       locationSlug: location.slug as string,
       topic: retryable.topic as string,
+      budgetMs: ROUTE_CYCLE_BUDGET_MS,
     });
 
     return NextResponse.json(
@@ -191,6 +198,7 @@ export async function GET(req: NextRequest) {
     jobId: claim.jobId as string,
     locationSlug: claim.locationSlug as string,
     topic: claim.topic as string,
+    budgetMs: ROUTE_CYCLE_BUDGET_MS,
   });
 
   return NextResponse.json(

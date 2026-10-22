@@ -4,6 +4,7 @@ import {
   type Article,
   type ArticleClaim,
 } from "./article";
+import { MIN_ARTICLE_QUALITY_SCORE } from "./config";
 import { findPlaceMentions } from "./places";
 import { isTrustedCitation } from "./sources";
 
@@ -509,7 +510,7 @@ export function checkQuality(
   );
 
   return {
-    pass: uniqueReasons.length === 0 && score >= 85,
+    pass: uniqueReasons.length === 0 && score >= MIN_ARTICLE_QUALITY_SCORE,
     score,
     reasons: uniqueReasons,
     warnings: uniqueWarnings,

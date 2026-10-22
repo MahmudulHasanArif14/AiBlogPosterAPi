@@ -15,7 +15,11 @@
  * Optional: AUTO_PUBLISH_ENABLED, AI_REQUEST_TIMEOUT_MS, CRON_SECRET.
  */
 
-import { PLATFORM_TIMEZONE, siteUrl } from "../src/lib/config";
+import {
+  PLATFORM_TIMEZONE,
+  QUALITY_CYCLE_BUDGET_MS,
+  siteUrl,
+} from "../src/lib/config";
 import { runGenerationJob } from "../src/lib/generation";
 import { supabaseAdmin } from "../src/lib/supabase";
 
@@ -117,12 +121,19 @@ async function revalidateHub() {
   }
 }
 
-async function claimDailySlot() {
+/**
+ * An earlier scheduled job that is still owed a finished article: either it
+ * never produced one, or its draft is below the quality bar and is waiting for
+ * another revision cycle.
+ *
+ * This runs *before* today's slot and does not touch the rotation. Resuming a
+ * draft must never consume a location's turn a second time -- the draft and its
+ * failure details are stored on the article the job already owns.
+ */
+async function pendingRevisionTarget() {
   const db = supabaseAdmin();
   const now = new Date();
 
-  // Finish an unfinished earlier job before taking a new slot, so a location
-  // whose turn failed keeps it rather than being skipped.
   const { data: unfinished, error: unfinishedError } = await db
     .from("generation_jobs")
     .select("id,location_id,topic,status,attempts,max_attempts,next_attempt_at")
@@ -141,22 +152,30 @@ async function claimDailySlot() {
       (!job.next_attempt_at || new Date(job.next_attempt_at) <= now),
   );
 
-  if (retryable) {
-    const { data: location } = await db
-      .from("locations")
-      .select("slug,enabled")
-      .eq("id", retryable.location_id)
-      .maybeSingle();
-
-    if (location?.enabled) {
-      return {
-        mode: "retry_unfinished" as const,
-        jobId: retryable.id as string,
-        locationSlug: location.slug as string,
-        topic: retryable.topic as string,
-      };
-    }
+  if (!retryable) {
+    return null;
   }
+
+  const { data: location } = await db
+    .from("locations")
+    .select("slug,enabled")
+    .eq("id", retryable.location_id)
+    .maybeSingle();
+
+  if (!location?.enabled) {
+    return null;
+  }
+
+  return {
+    jobId: retryable.id as string,
+    locationSlug: location.slug as string,
+    topic: retryable.topic as string,
+  };
+}
+
+async function claimDailySlot() {
+  const db = supabaseAdmin();
+  const now = new Date();
 
   const { data, error } = await db.rpc("claim_daily_generation_slot", {
     p_now: now.toISOString(),
@@ -370,52 +389,94 @@ async function main() {
     return;
   }
 
-  const started = Date.now();
-  let target: { jobId: string; locationSlug: string; topic: string };
+  const outcomes: { httpStatus: number; body: Record<string, unknown> }[] = [];
+  let published = 0;
+  let resumedJobId: string | null = null;
+
+  // A --daily run can do two cycles -- resume a pending revision, then take
+  // today's slot -- and both share one wall-clock budget. Giving each the full
+  // QUALITY_CYCLE_BUDGET_MS would let a single run last twice that, which is
+  // how the GitHub Actions job timeout gets hit and a job is killed still
+  // marked `processing`.
+  const runStartedAt = Date.now();
+  const totalBudgetMs = QUALITY_CYCLE_BUDGET_MS;
+
+  const budgetLeft = () =>
+    Math.max(0, totalBudgetMs - (Date.now() - runStartedAt));
+
+  const run = async (
+    label: string,
+    target: { jobId: string; locationSlug: string; topic: string },
+  ) => {
+    const started = Date.now();
+
+    console.log(`
+mode=${label} location=${target.locationSlug} job=${target.jobId} budgetMs=${budgetLeft()}`);
+
+    const outcome = await runGenerationJob({ ...target, budgetMs: budgetLeft() });
+    outcomes.push(outcome);
+
+    if (report(outcome, ((Date.now() - started) / 1000).toFixed(1))) {
+      published += 1;
+    }
+  };
 
   if (args.daily) {
+    // 1. Resume a draft an earlier cycle left below the quality bar. This does
+    //    not consume a rotation turn: it revises the article the job already
+    //    owns, starting from that article's stored best-known draft.
+    const pending = await pendingRevisionTarget();
+
+    if (pending) {
+      resumedJobId = pending.jobId;
+      await run("resume_revision", pending);
+    }
+
+    // 2. Then take today's own slot, so a draft still in revision does not stop
+    //    the platform publishing anything new. The slot is keyed on the London
+    //    day, so this cannot produce a second article for the same day.
     const slot = await claimDailySlot();
 
     if (slot.mode === "already_done") {
-      console.log("Today's article has already been generated. Nothing to do.");
-      return;
-    }
-
-    if (slot.mode === "exhausted") {
+      console.log("\nToday's article has already been generated.");
+    } else if (slot.mode === "exhausted") {
       console.error(
-        "Today's job has used all its attempts and needs manual review:",
+        "\nToday's job has used all its attempts and needs manual review:",
         JSON.stringify(slot.claim),
       );
       process.exit(1);
-    }
-
-    if (slot.mode === "location_disabled") {
-      console.error("Today's job points at a disabled location:", JSON.stringify(slot.claim));
+    } else if (slot.mode === "location_disabled") {
+      console.error(
+        "\nToday's job points at a disabled location:",
+        JSON.stringify(slot.claim),
+      );
       process.exit(1);
+    } else if (slot.jobId === resumedJobId) {
+      // Today's slot *is* the job just revised. It is now waiting on its own
+      // retry window, so running it again here would only hit the claim guard.
+      console.log(
+        "\nToday's slot is the job revised above; it resumes on the next cycle.",
+      );
+    } else {
+      await run(slot.mode, slot);
     }
-
-    console.log(`mode=${slot.mode} location=${slot.locationSlug} job=${slot.jobId}`);
-    target = slot;
   } else {
-    target = await createManualJob(args.location!, args.topic);
-    console.log(`mode=manual location=${target.locationSlug} job=${target.jobId}`);
+    await run("manual", await createManualJob(args.location!, args.topic));
   }
 
-  const outcome = await runGenerationJob(target);
-  const seconds = ((Date.now() - started) / 1000).toFixed(1);
-
-  console.log("");
-  const published = report(outcome, seconds);
-
-  if (published) {
+  if (published > 0) {
     await revalidateHub();
   }
 
-  // A retryable failure is not a red build: the job keeps its attempts and the
-  // next run picks it up. Only an unexpected failure should page anyone.
-  const body = outcome.body as { retryable?: boolean };
+  // A retryable failure is not a red build: the job keeps its attempts, its
+  // best draft is saved, and the next run resumes it. Only a failure nothing
+  // can recover from should page anyone.
+  const unrecoverable = outcomes.some((outcome) => {
+    const body = outcome.body as { retryable?: boolean };
+    return outcome.httpStatus >= 500 && !body.retryable;
+  });
 
-  if (outcome.httpStatus >= 500 && !body.retryable) {
+  if (unrecoverable) {
     process.exit(1);
   }
 }

@@ -42,7 +42,10 @@ export async function POST(req: NextRequest) {
     );
   }
 
-  const outcome = await runGenerationJob(parsed.data);
+  // The Hobby function ceiling is 60 seconds and one provider call already
+  // costs 60-115, so this route cannot run a revision cycle. The budget makes
+  // that explicit: the draft is saved and the scheduled worker revises it.
+  const outcome = await runGenerationJob({ ...parsed.data, budgetMs: 50_000 });
 
   return NextResponse.json(outcome.body, { status: outcome.httpStatus });
 }

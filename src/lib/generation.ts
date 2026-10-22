@@ -1,10 +1,26 @@
 import { createHash } from "node:crypto";
 import { z } from "zod";
-import { ArticleSchema, readingMinutes } from "./article";
-import { AI_REQUEST_TIMEOUT_MS, POSTS_CACHE_TAG, siteUrl } from "./config";
+import { ArticleSchema, readingMinutes, type Article } from "./article";
+import {
+  AI_REQUEST_TIMEOUT_MS,
+  MAX_ARTICLE_REVISION_AGE_HOURS,
+  MIN_ARTICLE_QUALITY_SCORE,
+  POSTS_CACHE_TAG,
+  siteUrl,
+} from "./config";
 import { enqueueDelivery } from "./delivery";
-import { findWikimediaImage } from "./images/wikimedia";
+import { findWikimediaImage, type FeaturedImage } from "./images/wikimedia";
 import { checkQuality, type ApprovedSource } from "./quality";
+import {
+  buildCorrectionInstructions,
+  parseRetryAfter,
+  runImprovementLoop,
+  type AttemptLog,
+  type DraftEvaluation,
+  type LoopResult,
+  type ProviderResult,
+  type RevisionRequest,
+} from "./revision";
 import { supabaseAdmin } from "./supabase";
 import { verifySources } from "./verification";
 
@@ -13,6 +29,12 @@ import { verifySources } from "./verification";
 // HTTP call: this project runs on Vercel's Hobby plan, where a function is
 // killed at 60 seconds, so a cron that waited on a second function's full
 // request budget could never finish.
+//
+// A draft that fails the quality gate is not abandoned. It goes back to the
+// provider with the exact checks it failed and is re-evaluated by the same
+// evaluator, repeatedly, until it passes or a bound is reached. The bounds and
+// the resume semantics live in ./revision; this module supplies the provider,
+// the evaluator and the persistence.
 
 // The configured model is a reasoning model: it spends completion tokens
 // thinking before it writes anything. At 4500 the entire budget went to
@@ -35,10 +57,23 @@ export type GenerationInput = {
   jobId: string;
   locationSlug: string;
   topic: string;
+  /**
+   * How long this cycle may spend revising. The scheduled worker leaves it
+   * unset and uses the configured default; the Vercel routes pass something
+   * well inside their own 60-second ceiling.
+   */
+  budgetMs?: number;
 };
 
 const POST_RETURN_COLUMNS =
   "id,title,slug,status,published_at,canonical_url,image_url,image_source_url,image_license";
+
+/**
+ * Everything a resumed cycle needs about the draft an earlier cycle left,
+ * plus the columns the API returns. One select, no duplicated column names.
+ */
+const RESUME_SELECT =
+  "id,title,slug,status,published_at,canonical_url,image_url,image_source_url,image_license,created_at,revision_count,provider_retry_count,best_quality_score,best_draft";
 
 function contentHash(value: string) {
   const normalised = value.toLowerCase().replace(/\s+/g, " ").trim();
@@ -83,21 +118,27 @@ function buildSystemPrompt() {
   ].join("\n");
 }
 
-function buildUserPrompt(input: {
+type PromptContext = {
   locationName: string;
   topic: string;
   recentArticleTitles: string[];
   approvedSources: ApprovedSource[];
-}) {
+};
+
+function serialiseSources(approvedSources: ApprovedSource[]) {
+  return approvedSources.map((source) => ({
+    name: source.sourceName,
+    url: source.sourceUrl,
+    coversWhat: source.notes,
+  }));
+}
+
+function buildUserPrompt(input: PromptContext) {
   return JSON.stringify({
     location: input.locationName,
     topicInstructions: input.topic,
     recentArticleTitles: input.recentArticleTitles,
-    approvedSources: input.approvedSources.map((source) => ({
-      name: source.sourceName,
-      url: source.sourceUrl,
-      coversWhat: source.notes,
-    })),
+    approvedSources: serialiseSources(input.approvedSources),
     requirements:
       "Choose the specific subject and angle yourself, using the location and " +
       "topic instructions as context rather than as a fixed title. Pick one " +
@@ -106,6 +147,201 @@ function buildUserPrompt(input: {
       "object described in the system message.",
   });
 }
+
+/**
+ * The correction prompt. It carries the previous draft, the checks it actually
+ * failed and the evidence behind them, so a revision can fix the named
+ * weaknesses rather than re-rolling the article.
+ *
+ * It never asks the model to invent a fact, fabricate a source, adjust a score
+ * or declare a failed check passed: an unsupportable claim has to leave the
+ * article. The evaluator rescores the result; nothing the model says about its
+ * own quality is read.
+ */
+export function buildRevisionPrompt(
+  request: RevisionRequest,
+  context: PromptContext & { preserveSlug: string },
+) {
+  const { evaluation } = request;
+
+  return JSON.stringify({
+    task:
+      "Improve the previous draft so it passes the named checks. Return the " +
+      "complete corrected article as a single JSON object in exactly the same " +
+      "schema as before — not a diff, not a commentary, not an explanation.",
+    previousDraft: request.draft,
+    failedChecks: request.failures,
+    whatToFix: request.instructions,
+    evidence: {
+      score: evaluation.score,
+      scoreRequired: MIN_ARTICLE_QUALITY_SCORE,
+      advisoryWarnings: evaluation.quality.warnings,
+      unsupportedClaims: evaluation.quality.details.unverifiedClaims,
+      undeclaredMaterialSentences:
+        evaluation.quality.details.undeclaredMaterialSentences,
+      unrecognisedPlaces: evaluation.quality.details.unrecognisedPlaces,
+      untrustedCitations: evaluation.quality.details.untrustedCitations,
+      sourceChecks: evaluation.verification.checks.map((check) => ({
+        url: check.url,
+        outcome: check.outcome,
+      })),
+      wordCount: evaluation.quality.details.words,
+      mostSimilarExistingArticle: evaluation.quality.details.mostSimilarSlug,
+      licensedImageFound: evaluation.imageOk,
+    },
+    mustNotChange: {
+      location: context.locationName,
+      topicInstructions: context.topic,
+      slug: context.preserveSlug,
+      note:
+        "Keep the same target location, the same business identity, and the " +
+        "same slug. The slug is part of a URL that may already be recorded, " +
+        "so return it unchanged even if you change the title.",
+    },
+    approvedSources: serialiseSources(context.approvedSources),
+    recentArticleTitles: context.recentArticleTitles,
+    rules: [
+      "Do not invent facts, sources, figures, reviews or credentials.",
+      "A claim you cannot trace to an approved source must be removed from the article, not softened.",
+      "Do not claim a check passes. The checks are re-run by a separate evaluator.",
+      "Keep everything the previous draft got right; change what the failed checks name.",
+    ],
+  });
+}
+
+// --- Provider adapter ------------------------------------------------------
+
+/**
+ * One provider call, classified for the retry policy.
+ *
+ * `permanent` covers the errors retrying cannot fix — bad credentials, a
+ * rejected request, a model that does not exist. Everything else (rate limits,
+ * 5xx, timeouts, truncated or unparseable output) is transient and gets a
+ * bounded, jittered retry.
+ */
+async function requestArticle(
+  userPrompt: string,
+  model: string,
+  key: string,
+): Promise<ProviderResult> {
+  let response: Response;
+
+  try {
+    response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${key}`,
+        "Content-Type": "application/json",
+        "HTTP-Referer": siteUrl(),
+        "X-Title": "Western Cars Content Hub",
+      },
+      body: JSON.stringify({
+        model,
+        temperature: 0.3,
+        max_tokens: AI_MAX_TOKENS,
+        response_format: { type: "json_object" },
+        messages: [
+          { role: "system", content: buildSystemPrompt() },
+          { role: "user", content: userPrompt },
+        ],
+      }),
+      signal: AbortSignal.timeout(AI_REQUEST_TIMEOUT_MS),
+    });
+  } catch {
+    return { ok: false, kind: "transient", code: "provider_timeout" };
+  }
+
+  if (!response.ok) {
+    if (response.status === 429) {
+      return {
+        ok: false,
+        kind: "transient",
+        code: "provider_rate_limit",
+        message: "provider responded 429",
+        retryAfterMs: parseRetryAfter(response.headers.get("retry-after")),
+      };
+    }
+
+    // 408 and 409 are worth another go; the rest of the 4xx range is the
+    // request itself being wrong, which a retry cannot change.
+    const permanent =
+      response.status >= 400 &&
+      response.status < 500 &&
+      response.status !== 408 &&
+      response.status !== 409;
+
+    return {
+      ok: false,
+      kind: permanent ? "permanent" : "transient",
+      code: permanent ? "provider_request_rejected" : "provider_error",
+      message: `provider responded ${response.status}`,
+    };
+  }
+
+  const payload = await response.json().catch(() => null);
+  const choice = payload?.choices?.[0];
+  const raw = choice?.message?.content;
+  const finishReason: string | undefined = choice?.finish_reason;
+  const usage = payload?.usage;
+
+  // A truncated response is a budget problem, not a bad article, and saying so
+  // is the difference between a one-line fix and a long hunt. Reasoning models
+  // hit this by thinking until the token budget is gone.
+  if (finishReason === "length" && (typeof raw !== "string" || raw.trim() === "")) {
+    const reasoningTokens =
+      usage?.completion_tokens_details?.reasoning_tokens ?? "unknown";
+
+    console.error(
+      `provider_output_truncated: finish_reason=length, completion_tokens=${
+        usage?.completion_tokens ?? "unknown"
+      }, reasoning_tokens=${reasoningTokens}, max_tokens=${AI_MAX_TOKENS}`,
+    );
+
+    return {
+      ok: false,
+      kind: "transient",
+      code: "provider_output_truncated",
+      message: `finish_reason=length reasoning_tokens=${reasoningTokens} max_tokens=${AI_MAX_TOKENS}`,
+    };
+  }
+
+  try {
+    if (typeof raw !== "string" || raw.trim() === "") {
+      throw new Error(
+        `provider returned no article content (finish_reason=${finishReason ?? "unknown"})`,
+      );
+    }
+
+    return { ok: true, article: ArticleSchema.parse(JSON.parse(raw)) };
+  } catch (error) {
+    const details =
+      error instanceof z.ZodError
+        ? error.issues.map((issue) => ({
+            field: issue.path.join("."),
+            message: issue.message,
+          }))
+        : undefined;
+
+    console.error(
+      `article validation failed (finish_reason=${finishReason ?? "unknown"}, completion_tokens=${
+        usage?.completion_tokens ?? "unknown"
+      }, content_length=${typeof raw === "string" ? raw.length : "n/a"}):`,
+      details ?? error,
+    );
+
+    // A malformed or schema-violating response is the model's output, not the
+    // request: another attempt is worth making, bounded by the provider retry
+    // budget rather than retried forever.
+    return {
+      ok: false,
+      kind: "transient",
+      code: "invalid_article_structure",
+      message: JSON.stringify(details ?? String(error)).slice(0, 400),
+    };
+  }
+}
+
+// --- Main entry point ------------------------------------------------------
 
 export async function runGenerationJob(
   input: GenerationInput,
@@ -126,6 +362,18 @@ export async function runGenerationJob(
     }
 
     return data as Record<string, unknown> | null;
+  };
+
+  const abandonJob = async (code: string, message?: string) => {
+    const { error } = await supabase.rpc("abandon_generation_job", {
+      p_job_id: jobId,
+      p_code: code,
+      p_message: message ?? code,
+    });
+
+    if (error) {
+      console.error("could not record job abandonment:", error.message);
+    }
   };
 
   // --- Location and job must agree ----------------------------------------
@@ -159,11 +407,17 @@ export async function runGenerationJob(
     };
   }
 
-  // --- Idempotency: one article per job, enforced by a unique index --------
+  // --- One article per job, enforced by a unique index --------------------
+  //
+  // An existing article is not automatically the end of the job. A published
+  // one is: there is nothing left to do. A draft still in review is the work in
+  // progress of an earlier cycle, and this cycle resumes *that* draft rather
+  // than generating a new article — which is what stops a revision consuming
+  // another day's rotation turn.
 
   const { data: existingPost, error: existingError } = await supabase
     .from("posts")
-    .select(POST_RETURN_COLUMNS)
+    .select(RESUME_SELECT)
     .eq("job_id", jobId)
     .maybeSingle();
 
@@ -177,7 +431,7 @@ export async function runGenerationJob(
     };
   }
 
-  if (existingPost) {
+  if (existingPost && existingPost.status === "published") {
     await supabase.rpc("complete_generation_job", {
       p_job_id: jobId,
       p_note: "recovered_existing_article",
@@ -186,6 +440,27 @@ export async function runGenerationJob(
     return {
       httpStatus: 200,
       body: { post: existingPost, alreadyGenerated: true },
+    };
+  }
+
+  // An operator's decision is final. `failed` is what /api/admin/review writes
+  // when someone rejects a draft, and `draft`/`queued` are states this pipeline
+  // never produces, so in both cases a human owns the row. Revising it would
+  // overwrite their decision and flip the article back into the review queue.
+  if (existingPost && existingPost.status !== "needs_review") {
+    await abandonJob(
+      "article_not_resumable",
+      `the article for this job is in status '${existingPost.status}', which only a person sets; it is not revised automatically`,
+    );
+
+    return {
+      httpStatus: 200,
+      body: {
+        post: existingPost,
+        needsManualReview: true,
+        code: "article_not_resumable",
+        status: existingPost.status,
+      },
     };
   }
 
@@ -209,6 +484,9 @@ export async function runGenerationJob(
   }
 
   if (!claimed) {
+    // Another worker holds the lease, the retry window has not opened, or the
+    // attempts are spent. Either way this process must not revise the article:
+    // two concurrent revisions of one draft would overwrite each other.
     return {
       httpStatus: 409,
       body: {
@@ -222,6 +500,35 @@ export async function runGenerationJob(
     };
   }
 
+  // A draft that has been in revision for too long stops being retried: the
+  // loop cannot promise that a permanently failing article will ever pass, and
+  // an unbounded retry would hold this location's rotation turn indefinitely.
+  //
+  // This is checked only once the claim is held. Abandoning a job on the
+  // strength of a read alone could terminate one another worker is part-way
+  // through revising.
+  if (existingPost) {
+    const ageMs = Date.now() - new Date(existingPost.created_at as string).getTime();
+    const maxAgeMs = MAX_ARTICLE_REVISION_AGE_HOURS * 3_600_000;
+
+    if (ageMs > maxAgeMs) {
+      await abandonJob(
+        "revision_window_expired",
+        `draft has been in revision for ${Math.round(ageMs / 3_600_000)}h, which exceeds MAX_ARTICLE_REVISION_AGE_HOURS=${MAX_ARTICLE_REVISION_AGE_HOURS}`,
+      );
+
+      return {
+        httpStatus: 200,
+        body: {
+          post: existingPost,
+          needsManualReview: true,
+          code: "revision_window_expired",
+          revisions: existingPost.revision_count,
+        },
+      };
+    }
+  }
+
   // --- Context: approved sources and existing content ---------------------
 
   const [sourcesResult, titlesResult, contentsResult] = await Promise.all([
@@ -229,10 +536,10 @@ export async function runGenerationJob(
       .from("content_sources")
       .select("source_name,source_url,notes")
       .eq("approved", true),
-    supabase.from("posts").select("title,slug"),
+    supabase.from("posts").select("id,title,slug"),
     supabase
       .from("posts")
-      .select("slug,content,location_id")
+      .select("id,slug,content,location_id")
       .eq("location_id", loc.id)
       .order("created_at", { ascending: false })
       .limit(25),
@@ -284,23 +591,32 @@ export async function runGenerationJob(
     };
   }
 
-  const existingTitles = (titlesResult.data ?? []).map(
-    (row) => row.title as string,
-  );
-  const existingSlugs = (titlesResult.data ?? []).map(
-    (row) => row.slug as string,
-  );
-  const existingContents = (contentsResult.data ?? []).map((row) => ({
-    slug: row.slug as string,
-    content: (row.content as string | null) ?? "",
-  }));
+  // The article being revised must not count as its own duplicate, so the row
+  // this job owns is excluded from the duplication corpus.
+  const ownPostId = (existingPost?.id as string | undefined) ?? null;
 
-  // --- Generate -----------------------------------------------------------
+  const existingTitles = (titlesResult.data ?? [])
+    .filter((row) => row.id !== ownPostId)
+    .map((row) => row.title as string);
+  const existingSlugs = (titlesResult.data ?? [])
+    .filter((row) => row.id !== ownPostId)
+    .map((row) => row.slug as string);
+  const existingContents = (contentsResult.data ?? [])
+    .filter((row) => row.id !== ownPostId)
+    .map((row) => ({
+      slug: row.slug as string,
+      content: (row.content as string | null) ?? "",
+    }));
+
+  // --- Provider -----------------------------------------------------------
 
   const model = process.env.OPENROUTER_MODEL;
   const key = process.env.OPENROUTER_API_KEY;
 
   if (!model || !key) {
+    // Bounded by the job's own attempt budget rather than abandoned outright:
+    // the fix is an environment variable, and once it is set the next cycle
+    // should pick the job up instead of needing a manual requeue.
     await failJob("ai_provider_not_configured");
 
     return {
@@ -309,160 +625,212 @@ export async function runGenerationJob(
     };
   }
 
-  let aiResponse: Response;
+  const promptContext: PromptContext = {
+    locationName: loc.name as string,
+    topic: input.topic,
+    recentArticleTitles: existingTitles.slice(0, 40),
+    approvedSources,
+  };
 
-  try {
-    aiResponse = await fetch("https://openrouter.ai/api/v1/chat/completions", {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${key}`,
-        "Content-Type": "application/json",
-        "HTTP-Referer": siteUrl(),
-        "X-Title": "Western Cars Content Hub",
-      },
-      body: JSON.stringify({
-        model,
-        temperature: 0.3,
-        max_tokens: AI_MAX_TOKENS,
-        response_format: { type: "json_object" },
-        messages: [
-          { role: "system", content: buildSystemPrompt() },
-          {
-            role: "user",
-            content: buildUserPrompt({
-              locationName: loc.name as string,
-              topic: input.topic,
-              recentArticleTitles: existingTitles.slice(0, 40),
-              approvedSources,
-            }),
-          },
-        ],
-      }),
-      signal: AbortSignal.timeout(AI_REQUEST_TIMEOUT_MS),
+  // --- The evaluator ------------------------------------------------------
+  //
+  // The single source of truth for pass and fail, used identically on the first
+  // draft and on every revision. The score it returns is the one that is
+  // stored; the model's opinion of its own article is never read.
+  //
+  // The provenance check and the image lookup are network-bound and independent
+  // of each other, so they run together: sequentially they were the two slowest
+  // steps after generation.
+
+  // The image each draft was evaluated with, so the row that is saved carries
+  // the licence that was actually checked against the draft being saved --
+  // not whatever the last revision happened to find.
+  const imageByDraft = new Map<Article, FeaturedImage | null>();
+  let matchedImage: FeaturedImage | null = null;
+
+  const evaluate = async (article: Article): Promise<DraftEvaluation> => {
+    const quality = checkQuality(article, {
+      locationName: loc.name as string,
+      existingTitles,
+      existingSlugs,
+      existingContents,
+      approvedSources,
     });
-  } catch {
-    await failJob("provider_timeout");
 
-    return {
-      httpStatus: 503,
-      body: {
-        error: "Provider timeout; the job is retained for retry",
-        code: "provider_timeout",
-        retryable: true,
-      },
-    };
-  }
+    const declaredSourceUrls = [
+      ...article.sources,
+      ...article.claims
+        .map((claim) => claim.sourceUrl)
+        .filter((url): url is string => typeof url === "string"),
+    ];
 
-  if (!aiResponse.ok) {
-    const code =
-      aiResponse.status === 429 ? "provider_rate_limit" : "provider_error";
+    const [verification, image] = await Promise.all([
+      verifySources(declaredSourceUrls, approvedSources),
+      // A licence once matched stays matched: re-fetching it on every revision
+      // would spend the cycle's budget re-answering a settled question.
+      matchedImage
+        ? Promise.resolve(matchedImage)
+        : findWikimediaImage(loc.name as string, article.title).catch((error) => {
+            console.error("image lookup failed:", error);
+            return null;
+          }),
+    ]);
 
-    await failJob(code, `provider responded ${aiResponse.status}`);
-
-    return {
-      httpStatus: 503,
-      body: {
-        error:
-          aiResponse.status === 429
-            ? "Provider rate limit; the job is retained for retry"
-            : "Provider error; the job is retained for retry",
-        code,
-        retryable: true,
-      },
-    };
-  }
-
-  const payload = await aiResponse.json().catch(() => null);
-  const choice = payload?.choices?.[0];
-  const raw = choice?.message?.content;
-  const finishReason: string | undefined = choice?.finish_reason;
-  const usage = payload?.usage;
-
-  // A truncated response is a budget problem, not a bad article, and saying so
-  // is the difference between a one-line fix and a long hunt. Reasoning models
-  // hit this by thinking until the token budget is gone.
-  if (finishReason === "length" && (typeof raw !== "string" || raw.trim() === "")) {
-    const reasoningTokens =
-      usage?.completion_tokens_details?.reasoning_tokens ?? "unknown";
-
-    console.error(
-      `provider_output_truncated: finish_reason=length, completion_tokens=${
-        usage?.completion_tokens ?? "unknown"
-      }, reasoning_tokens=${reasoningTokens}, max_tokens=${AI_MAX_TOKENS}`,
-    );
-
-    await failJob(
-      "provider_output_truncated",
-      `finish_reason=length reasoning_tokens=${reasoningTokens} max_tokens=${AI_MAX_TOKENS}`,
-    );
-
-    return {
-      httpStatus: 503,
-      body: {
-        error:
-          "The model used its whole token budget before writing the article. Raise max_tokens or lower the reasoning effort.",
-        code: "provider_output_truncated",
-        finishReason,
-        reasoningTokens,
-        retryable: true,
-      },
-    };
-  }
-
-  let article;
-
-  try {
-    if (typeof raw !== "string" || raw.trim() === "") {
-      throw new Error(
-        `provider returned no article content (finish_reason=${finishReason ?? "unknown"})`,
-      );
+    if (image) {
+      matchedImage = image;
     }
 
-    article = ArticleSchema.parse(JSON.parse(raw));
-  } catch (error) {
-    const details =
-      error instanceof z.ZodError
-        ? error.issues.map((issue) => ({
-            field: issue.path.join("."),
-            message: issue.message,
-          }))
-        : undefined;
+    imageByDraft.set(article, image);
 
-    console.error(
-      `article validation failed (finish_reason=${finishReason ?? "unknown"}, completion_tokens=${
-        usage?.completion_tokens ?? "unknown"
-      }, content_length=${typeof raw === "string" ? raw.length : "n/a"}):`,
-      details ?? error,
-    );
+    const blocking = [...quality.reasons];
 
-    await failJob("invalid_article_structure", JSON.stringify(details ?? {}));
+    if (!image) {
+      blocking.push("image_not_verified");
+    }
+
+    if (verification.status !== "verified") {
+      blocking.push(`verification_${verification.status}`);
+    }
+
+    const uniqueBlocking = [...new Set(blocking)];
 
     return {
-      httpStatus: 422,
+      score: quality.score,
+      // Both conditions, always: the score *and* every mandatory gate. A high
+      // score can never carry a failed provenance check.
+      pass: uniqueBlocking.length === 0 && quality.score >= MIN_ARTICLE_QUALITY_SCORE,
+      blocking: uniqueBlocking,
+      quality,
+      verification,
+      imageOk: Boolean(image),
+    };
+  };
+
+  // --- Resume an earlier cycle's draft, or start a new one -----------------
+
+  let resumeFrom: { article: Article } | null = null;
+
+  if (existingPost?.best_draft) {
+    const parsed = ArticleSchema.safeParse(existingPost.best_draft);
+
+    if (parsed.success) {
+      resumeFrom = { article: parsed.data };
+    } else {
+      console.warn(
+        `stored best_draft for job ${jobId} no longer matches the article schema; starting a fresh draft for the same job`,
+      );
+    }
+  }
+
+  const carriedRevisions = (existingPost?.revision_count as number | undefined) ?? 0;
+  const carriedProviderRetries =
+    (existingPost?.provider_retry_count as number | undefined) ?? 0;
+
+  // --- Generate, evaluate, improve, re-evaluate ---------------------------
+
+  const attemptLog: AttemptLog[] = [];
+
+  const loop: LoopResult = await runImprovementLoop(
+    {
+      generateInitial: () =>
+        requestArticle(buildUserPrompt(promptContext), model, key),
+      reviseDraft: (request) =>
+        requestArticle(
+          buildRevisionPrompt(request, {
+            ...promptContext,
+            preserveSlug: request.draft.slug,
+          }),
+          model,
+          key,
+        ),
+      evaluate,
+      // A full cycle can outlast the five-minute processing lease, which would
+      // let a second worker take the job mid-revision.
+      heartbeat: async () => {
+        const { error } = await supabase
+          .from("generation_jobs")
+          .update({ processing_started_at: new Date().toISOString() })
+          .eq("id", jobId)
+          .eq("status", "processing");
+
+        if (error) {
+          console.error("lease heartbeat failed:", error.message);
+        }
+      },
+      log: (entry) => {
+        attemptLog.push(entry);
+
+        console.log(
+          `[revision] job=${jobId} attempt=${entry.attempt} kind=${entry.kind} ` +
+            `score=${entry.score ?? "n/a"} pass=${entry.pass} ` +
+            `blocking=${entry.blocking.join("|") || "none"} ` +
+            `verification=${entry.verificationStatus ?? "n/a"} ` +
+            `provider=${entry.providerCode ?? "ok"} ` +
+            `providerRetries=${entry.providerRetries} elapsedMs=${entry.elapsedMs}`,
+        );
+      },
+    },
+    {
+      budgetMs: input.budgetMs,
+      // A call that cannot finish inside what is left of the cycle is not
+      // started: the next cycle resumes the draft instead.
+      minCallBudgetMs: AI_REQUEST_TIMEOUT_MS,
+      resumeFrom,
+    },
+  );
+
+  const totalRevisions = carriedRevisions + loop.revisions;
+  const totalProviderRetries = carriedProviderRetries + loop.providerRetries;
+
+  // --- Nothing to save ----------------------------------------------------
+
+  if (!loop.best) {
+    const code = loop.lastError?.code ?? "generation_failed";
+
+    if (loop.outcome === "terminal") {
+      await abandonJob(code, loop.lastError?.message);
+
+      return {
+        httpStatus: 500,
+        body: {
+          error:
+            "The provider rejected the request in a way retrying cannot fix. The job needs an operator.",
+          code,
+          retryable: false,
+          attempts: attemptLog,
+        },
+      };
+    }
+
+    await failJob(code, loop.lastError?.message);
+
+    return {
+      httpStatus: 503,
       body: {
-        error: "Invalid article structure",
-        code: "invalid_article_structure",
-        details,
+        error: "No draft could be produced; the job is retained for retry",
+        code,
         retryable: true,
+        providerRetries: totalProviderRetries,
+        attempts: attemptLog,
       },
     };
   }
 
-  // --- Quality gate -------------------------------------------------------
+  // --- Persist ------------------------------------------------------------
 
-  const quality = checkQuality(article, {
-    locationName: loc.name as string,
-    existingTitles,
-    existingSlugs,
-    existingContents,
-    approvedSources,
-  });
+  const { article, evaluation } = loop.best;
+  const passed = loop.outcome === "passed" && evaluation.pass;
 
-  // --- Provenance check and featured image --------------------------------
-  //
-  // Both are network-bound and independent of each other, so they run together.
-  // Sequentially they were the two slowest steps after generation, and the
-  // whole handler has to finish inside 60 seconds.
+  const autoPublishAllowed = process.env.AUTO_PUBLISH_ENABLED === "true";
+  const publish = passed && autoPublishAllowed;
+
+  if (passed && !autoPublishAllowed) {
+    evaluation.quality.warnings.push("auto_publish_disabled");
+  }
+
+  const licensedImage = imageByDraft.get(article) ?? null;
+  const base = siteUrl();
+  const now = new Date().toISOString();
 
   const declaredSourceUrls = [
     ...article.sources,
@@ -471,37 +839,16 @@ export async function runGenerationJob(
       .filter((url): url is string => typeof url === "string"),
   ];
 
-  const [verification, image] = await Promise.all([
-    verifySources(declaredSourceUrls, approvedSources),
-    findWikimediaImage(loc.name as string, article.title).catch((error) => {
-      console.error("image lookup failed:", error);
-      return null;
-    }),
-  ]);
-
-  // --- Publication decision ------------------------------------------------
-
-  const blocking = [...quality.reasons];
-
-  if (!image) {
-    blocking.push("image_not_verified");
-  }
-
-  if (verification.status !== "verified") {
-    blocking.push(`verification_${verification.status}`);
-  }
-
-  const uniqueBlocking = [...new Set(blocking)];
-
-  const autoPublishAllowed = process.env.AUTO_PUBLISH_ENABLED === "true";
-  const publish = uniqueBlocking.length === 0 && autoPublishAllowed;
-
-  if (uniqueBlocking.length === 0 && !autoPublishAllowed) {
-    quality.warnings.push("auto_publish_disabled");
-  }
-
-  const base = siteUrl();
-  const now = new Date().toISOString();
+  // The latest revision is only worth keeping separately when it was not the
+  // draft we are storing: that is the diagnosis case.
+  const latestDraft =
+    loop.latest && loop.latest.article !== article
+      ? {
+          article: loop.latest.article,
+          score: loop.latest.evaluation.score,
+          blocking: loop.latest.evaluation.blocking,
+        }
+      : null;
 
   const postData = {
     location_id: loc.id,
@@ -512,6 +859,8 @@ export async function runGenerationJob(
     content: article.content,
     meta_description: article.metaDescription,
 
+    // Reaching the retry limit is never a reason to publish. Only the
+    // evaluator's verdict can move an article out of review.
     status: publish ? "published" : "needs_review",
     published_at: publish ? now : null,
     canonical_url: publish ? `${base}/posts/${article.slug}` : null,
@@ -524,48 +873,68 @@ export async function runGenerationJob(
 
     // The score the database trigger checks must reflect everything blocking,
     // not just the text-level gate, or a missing image could slip through.
-    quality_score: uniqueBlocking.length === 0 ? quality.score : Math.min(quality.score, 60),
-    quality_reasons: uniqueBlocking,
-    verification_status: verification.status,
-    verified_claims: quality.details.verifiedClaims,
+    quality_score:
+      evaluation.blocking.length === 0
+        ? evaluation.score
+        : Math.min(evaluation.score, 60),
+    quality_reasons: evaluation.blocking,
+    verification_status: evaluation.verification.status,
+    verified_claims: evaluation.quality.details.verifiedClaims,
     source_urls: [...new Set(declaredSourceUrls)],
-    review_notes:
-      uniqueBlocking.length === 0
-        ? null
-        : [
-            `Blocked by: ${uniqueBlocking.join(", ")}`,
-            quality.details.undeclaredMaterialSentences.length > 0
-              ? `Undeclared material sentences: ${JSON.stringify(
-                  quality.details.undeclaredMaterialSentences,
-                )}`
-              : null,
-            quality.details.unverifiedClaims.length > 0
-              ? `Unverified claims: ${JSON.stringify(quality.details.unverifiedClaims)}`
-              : null,
-            quality.details.unrecognisedPlaces.length > 0
-              ? `Unrecognised places: ${quality.details.unrecognisedPlaces.join(", ")}`
-              : null,
-          ]
-            .filter(Boolean)
-            .join("\n"),
 
-    image_url: image?.image_url ?? null,
-    image_alt: image?.image_alt ?? null,
-    image_credit: image?.image_credit ?? null,
-    image_source_url: image?.image_source_url ?? null,
-    image_provider: image?.image_provider ?? null,
-    image_mime: image?.image_mime ?? null,
-    image_width: image?.image_width ?? null,
-    image_height: image?.image_height ?? null,
-    image_license: image?.image_license ?? null,
-    image_license_url: image?.image_license_url ?? null,
+    revision_count: totalRevisions,
+    provider_retry_count: totalProviderRetries,
+    best_quality_score: evaluation.score,
+    best_draft: article,
+    latest_draft: latestDraft,
+    last_revision_at: now,
+
+    review_notes: passed
+      ? null
+      : [
+          `Blocked by: ${evaluation.blocking.join(", ") || `score ${evaluation.score} < ${MIN_ARTICLE_QUALITY_SCORE}`}`,
+          `Revisions attempted: ${totalRevisions}, provider retries: ${totalProviderRetries}, outcome: ${loop.outcome}`,
+          ...buildCorrectionInstructions(evaluation),
+          evaluation.quality.details.undeclaredMaterialSentences.length > 0
+            ? `Undeclared material sentences: ${JSON.stringify(
+                evaluation.quality.details.undeclaredMaterialSentences,
+              )}`
+            : null,
+          evaluation.quality.details.unverifiedClaims.length > 0
+            ? `Unverified claims: ${JSON.stringify(evaluation.quality.details.unverifiedClaims)}`
+            : null,
+          evaluation.quality.details.unrecognisedPlaces.length > 0
+            ? `Unrecognised places: ${evaluation.quality.details.unrecognisedPlaces.join(", ")}`
+            : null,
+          loop.lastError ? `Last provider error: ${loop.lastError.code}` : null,
+        ]
+          .filter(Boolean)
+          .join("\n"),
+
+    image_url: licensedImage?.image_url ?? null,
+    image_alt: licensedImage?.image_alt ?? null,
+    image_credit: licensedImage?.image_credit ?? null,
+    image_source_url: licensedImage?.image_source_url ?? null,
+    image_provider: licensedImage?.image_provider ?? null,
+    image_mime: licensedImage?.image_mime ?? null,
+    image_width: licensedImage?.image_width ?? null,
+    image_height: licensedImage?.image_height ?? null,
+    image_license: licensedImage?.image_license ?? null,
+    image_license_url: licensedImage?.image_license_url ?? null,
   };
 
-  const { data: post, error: saveError } = await supabase
-    .from("posts")
-    .insert(postData)
-    .select(POST_RETURN_COLUMNS)
-    .single();
+  const { data: post, error: saveError } = existingPost
+    ? await supabase
+        .from("posts")
+        .update(postData)
+        .eq("id", existingPost.id as string)
+        .select(POST_RETURN_COLUMNS)
+        .single()
+    : await supabase
+        .from("posts")
+        .insert(postData)
+        .select(POST_RETURN_COLUMNS)
+        .single();
 
   if (saveError || !post) {
     console.error("article save failed:", saveError?.message);
@@ -577,7 +946,7 @@ export async function runGenerationJob(
       .eq("job_id", jobId)
       .maybeSingle();
 
-    if (recovered) {
+    if (recovered && (recovered as { status?: string }).status === "published") {
       await supabase.rpc("complete_generation_job", {
         p_job_id: jobId,
         p_note: "recovered_existing_article",
@@ -609,11 +978,31 @@ export async function runGenerationJob(
     };
   }
 
-  await supabase.rpc("complete_generation_job", {
-    p_job_id: jobId,
-    p_note:
-      uniqueBlocking.length === 0 ? null : `quality:${uniqueBlocking.join(",")}`,
-  });
+  // --- Job state ----------------------------------------------------------
+  //
+  // Only a passing article completes the job. A draft that is still below the
+  // bar goes back to the retry queue with the job's own backoff, so the next
+  // cycle resumes it; once the job's attempt budget is spent fail_generation_job
+  // makes it 'exhausted' and the draft stays in review for a person to pick up.
+
+  let jobState: Record<string, unknown> | null = null;
+
+  if (passed) {
+    await supabase.rpc("complete_generation_job", {
+      p_job_id: jobId,
+      p_note: `passed after ${totalRevisions} revision(s)`,
+    });
+  } else if (loop.outcome === "terminal") {
+    await abandonJob(
+      loop.lastError?.code ?? "revision_unrecoverable",
+      loop.lastError?.message,
+    );
+  } else {
+    jobState = await failJob(
+      "quality_below_threshold",
+      `score=${evaluation.score} blocking=${evaluation.blocking.join(",") || "none"} revisions=${totalRevisions}`,
+    );
+  }
 
   // Clear the cached listings so a newly published article is visible on the
   // next request rather than after the revalidate window. Outside a Next
@@ -641,7 +1030,11 @@ export async function runGenerationJob(
   }
 
   const { error: activityError } = await supabase.from("activity_log").insert({
-    action: publish ? "auto_published" : "generated_for_review",
+    action: publish
+      ? "auto_published"
+      : passed
+        ? "passed_pending_publish"
+        : "generated_for_review",
     entity_type: "post",
     entity_id: post.id,
     details: {
@@ -649,21 +1042,26 @@ export async function runGenerationJob(
       job_id: jobId,
       location: loc.slug,
       quality_score: postData.quality_score,
-      quality_reasons: uniqueBlocking,
-      quality_warnings: quality.warnings,
-      words: quality.details.words,
-      max_content_similarity: quality.details.maxContentSimilarity,
-      verification_status: verification.status,
-      verification_checks: verification.checks,
-      verified_claim_count: quality.details.verifiedClaims.length,
-      unverified_claims: quality.details.unverifiedClaims,
-      unrecognised_places: quality.details.unrecognisedPlaces,
-      undeclared_material_sentences: quality.details.undeclaredMaterialSentences,
-      image_found: Boolean(image),
-      image_provider: image?.image_provider ?? null,
-      image_license: image?.image_license ?? null,
+      quality_reasons: evaluation.blocking,
+      quality_warnings: evaluation.quality.warnings,
+      words: evaluation.quality.details.words,
+      max_content_similarity: evaluation.quality.details.maxContentSimilarity,
+      verification_status: evaluation.verification.status,
+      verification_checks: evaluation.verification.checks,
+      verified_claim_count: evaluation.quality.details.verifiedClaims.length,
+      unverified_claims: evaluation.quality.details.unverifiedClaims,
+      unrecognised_places: evaluation.quality.details.unrecognisedPlaces,
+      undeclared_material_sentences:
+        evaluation.quality.details.undeclaredMaterialSentences,
+      image_found: Boolean(licensedImage),
+      image_provider: licensedImage?.image_provider ?? null,
+      image_license: licensedImage?.image_license ?? null,
       delivery_enqueued: delivery?.ok ?? null,
       delivery_id: delivery?.deliveryId ?? null,
+      loop_outcome: loop.outcome,
+      revisions: totalRevisions,
+      provider_retries: totalProviderRetries,
+      revision_attempts: attemptLog,
     },
   });
 
@@ -672,31 +1070,43 @@ export async function runGenerationJob(
   }
 
   return {
-    httpStatus: 201,
+    // A draft that will be revised again is not an error and not a success:
+    // 202 says the work is accepted and still in progress.
+    httpStatus: passed ? (existingPost ? 200 : 201) : 202,
     body: {
       post,
       published: publish,
       // Surfaced so the worker's log says whether distribution was queued, not
       // just whether the article published.
       delivery,
+      loop: {
+        outcome: loop.outcome,
+        revisions: totalRevisions,
+        providerRetries: totalProviderRetries,
+        attempts: attemptLog,
+        nextAttemptAt: jobState?.nextAttemptAt ?? null,
+        exhausted: jobState?.exhausted ?? (loop.outcome === "terminal" || null),
+      },
+      retryable: !passed && loop.outcome === "retry_later",
       quality: {
         score: postData.quality_score,
-        pass: uniqueBlocking.length === 0,
-        reasons: uniqueBlocking,
-        warnings: quality.warnings,
-        words: quality.details.words,
-        maxContentSimilarity: quality.details.maxContentSimilarity,
-        unverifiedClaims: quality.details.unverifiedClaims,
-        unrecognisedPlaces: quality.details.unrecognisedPlaces,
-        undeclaredMaterialSentences: quality.details.undeclaredMaterialSentences,
+        pass: passed,
+        reasons: evaluation.blocking,
+        warnings: evaluation.quality.warnings,
+        words: evaluation.quality.details.words,
+        maxContentSimilarity: evaluation.quality.details.maxContentSimilarity,
+        unverifiedClaims: evaluation.quality.details.unverifiedClaims,
+        unrecognisedPlaces: evaluation.quality.details.unrecognisedPlaces,
+        undeclaredMaterialSentences:
+          evaluation.quality.details.undeclaredMaterialSentences,
       },
-      verification,
-      image: image
+      verification: evaluation.verification,
+      image: licensedImage
         ? {
-            provider: image.image_provider,
-            sourceUrl: image.image_source_url,
-            license: image.image_license,
-            licenseUrl: image.image_license_url,
+            provider: licensedImage.image_provider,
+            sourceUrl: licensedImage.image_source_url,
+            license: licensedImage.image_license,
+            licenseUrl: licensedImage.image_license_url,
           }
         : null,
     },
